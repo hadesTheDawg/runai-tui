@@ -114,7 +114,7 @@ DEFAULTS = {
         "defaults": {"kind": "training", "command": "echo hello from $(hostname); nproc; sleep 30",
                      "gpu": "none", "gpu_amount": "0.5", "pool": "any", "cpu": "0.5", "memory": "1Gi",
                      "run_as_me": True, "scratch": "", "shm": "", "env_vars": "", "completions": "1",
-                     "ttl": "3600", "priority": "default", "preempt": "default"},
+                     "ttl": "3600", "max_run": "", "priority": "default", "preempt": "default"},
     },
     "hooks": {
         "pre_submit": [],    # sh -c commands: manifest on stdin, non-empty stdout replaces it, exit != 0 rejects
@@ -390,6 +390,24 @@ def dur(sec):
     return f"{sec // 86400}d{sec % 86400 // 3600:02d}h"
 
 
+DUR_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([dhms]?)", re.I)
+DUR_UNIT = {"d": 86400, "h": 3600, "m": 60, "s": 1, "": 1}
+
+
+def parse_duration(s):
+    """'90m', '2h', '1h30m', '1.5d', '3600' (seconds) -> seconds; '' -> None; ValueError otherwise."""
+    s = str(s or "").strip().replace(" ", "")
+    if not s:
+        return None
+    parts = DUR_RE.findall(s)
+    if not parts or "".join(a + b for a, b in parts) != s:
+        raise ValueError(f"'{s}': use e.g. 90m, 2h, 1h30m, 1d")
+    sec = int(sum(float(a) * DUR_UNIT[b.lower()] for a, b in parts))
+    if sec < 1:
+        raise ValueError(f"'{s}': must be longer than 0s")
+    return sec
+
+
 def num(x, nd=2):
     if x in (None, -1):
         return "∞" if x == -1 else "-"
@@ -450,6 +468,54 @@ def remember_owned(project, name):
         os.replace(OWNED + ".tmp", OWNED)
     except OSError:
         pass
+
+
+LIMITS = os.path.join(STATE, "limits.json")
+
+
+def load_limits():
+    """"project/name" -> max run time in seconds, of workloads submitted from here."""
+    try:
+        with open(LIMITS) as f:
+            return {k: int(v) for k, v in json.load(f).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def remember_limit(project, name, sec):
+    limits = load_limits()
+    limits[f"{project}/{name}"] = int(sec)
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(LIMITS + ".tmp", "w") as f:
+            json.dump(dict(list(limits.items())[-500:]), f)
+        os.replace(LIMITS + ".tmp", LIMITS)
+    except OSError:
+        pass
+
+
+def pod_deadlines(namespace, pods=None, workload=None):
+    """-> {pod name: activeDeadlineSeconds or None} from kubectl: the named pods, or the workload's
+    pods that still run; None when kubectl cannot read them."""
+    argv = [KUBECTL, "get", "pod"] + (list(pods) if pods else ["-l", f"workloadName={workload}"])
+    rc, out, _ = cmd(argv + ["-n", namespace, "-o", "json"], timeout=20)
+    if rc != 0:
+        return None
+    try:
+        d = json.loads(out or "{}")
+        items = d["items"] if "items" in d else [d]
+    except ValueError:
+        return None
+    return {(p.get("metadata") or {}).get("name"): (p.get("spec") or {}).get("activeDeadlineSeconds")
+            for p in items if pods or (p.get("status") or {}).get("phase") not in ("Succeeded", "Failed")}
+
+
+def set_pod_deadline(namespace, pod, sec):
+    """Pods (unlike their Job or workspace) take a new activeDeadlineSeconds while they run."""
+    patch = json.dumps({"spec": {"activeDeadlineSeconds": int(sec)}})
+    rc, out, err = cmd([KUBECTL, "patch", "pod", pod, "-n", namespace, "-p", patch], timeout=20)
+    log_action(f"max run time {dur(sec)} on pod {pod}", None, rc, out + err)
+    return rc == 0, first_error(err, out)
 
 
 def is_service(w):
@@ -689,6 +755,8 @@ class State:
         self.updated = 0
         self.me = ""
         self.owned = load_owned()        # "project/name" submitted from here (kubectl ones have no submitter)
+        self.limits = load_limits()      # "project/name" -> max run time (s), of those submitted from here
+        self.deadlines = {}              # workload id -> (pod names, {pod: activeDeadlineSeconds} | None)
 
     def mine(self, w):
         by = w.get("submittedBy")
@@ -706,6 +774,20 @@ class State:
             if source == "submitted":
                 self.owned.add(f"{project}/{name}")
                 remember_owned(project, name)
+
+    def set_limit(self, project, name, sec):
+        with self.lock:
+            self.limits[f"{project}/{name}"] = int(sec)
+        remember_limit(project, name, sec)
+
+    def max_run(self, w):
+        """-> the workload's max run time in seconds, or None: as submitted from here, else as its
+        pods have it (read with kubectl for the workload in focus)."""
+        sec = self.limits.get(f"{w.get('projectName')}/{w.get('name')}")
+        if sec:
+            return sec
+        got = (self.deadlines.get(w.get("id")) or (None, None))[1] or {}
+        return max([d for d in got.values() if d] or [0]) or None
 
     def in_flight(self):
         with self.lock:
@@ -755,6 +837,7 @@ class Poller(threading.Thread):
         self.ev = threading.Event()
         self.assets_at = 0
         self.full_at = 0
+        self.limit_at = {}               # workload id -> when its pods were last checked for the max run time
 
     def wake(self):
         self.ev.set()
@@ -779,6 +862,32 @@ class Poller(threading.Thread):
             return None
         with st.lock:
             return {st.scope} | {p for (p, _), info in st.watch.items() if not info["done_at"]}
+
+    def limit_pods(self, wls, fid, pods):
+        """Max run times: workspaces (the CLI has no flag for it) and pods re-created after a preemption
+        get it on their pods once they exist; the workload in focus has its pods' deadlines read for
+        the details."""
+        st, now = self.state, time.time()
+        for w in wls:
+            sec = st.limits.get(f"{w.get('projectName')}/{w.get('name')}")
+            if not sec or w.get("phase") in TERMINAL | STOPPED | {"Pending", "Creating", "Submitted"} \
+                    or now - self.limit_at.get(w["id"], 0) < 60:
+                continue
+            self.limit_at[w["id"]] = now
+            ns = w.get("namespace") or project_namespace(st, w.get("projectName"))
+            got = pod_deadlines(ns, workload=w.get("name"))
+            for pod, d in (got or {}).items():
+                if not d:
+                    set_pod_deadline(ns, pod, sec)
+        if fid and isinstance(pods, list):
+            names = tuple(sorted(p.get("name") for p in pods if p.get("name")))
+            if names and (st.deadlines.get(fid) or (None,))[0] != names:
+                w = next((x for x in wls if x.get("id") == fid), None)
+                ns = (w or {}).get("namespace") or (pods[0].get("namespace") if pods else None)
+                if ns:
+                    got = pod_deadlines(ns, pods=names)
+                    with st.lock:
+                        st.deadlines[fid] = (names, got)
 
     def poll(self):
         st, sess = self.state, self.sess
@@ -816,6 +925,7 @@ class Poller(threading.Thread):
                     pods = (sess.api(f"{CFG['api']['workloads']}/{fid}/pods") or {}).get("pods") or []
                 except ApiError as e:
                     pods = str(e)
+            self.limit_pods(wls, fid, pods)
             now = time.time()
             by_name = lambda e: (e.get("meta") or {}).get("name", "")
             with st.lock:
@@ -1534,6 +1644,13 @@ def build_workload(v, sess, state):
     warn += bind_warn
     pvcs, pvc_warn = parse_pvcs(v.get("pvcs"))
     warn += pvc_warn
+    try:
+        max_run = parse_duration(v.get("max_run"))
+    except ValueError as e:
+        max_run = None
+        warn.append(f"max run time {e}")
+    if max_run and kind == "service":
+        warn.append("max run time: services run until deleted (ignored)")
 
     if kind == "workspace":                      # Run:ai CLI, keeps the environment's tools/URLs
         argv = [RUNAI, "workspace", "submit", name, "-p", proj]
@@ -1651,6 +1768,8 @@ def build_workload(v, sess, state):
         container["volumeMounts"] = mounts
     if kind != "service":
         spec["restartPolicy"] = "Never"
+        if max_run:                              # counted from the pod's start; then it fails with DeadlineExceeded
+            spec["activeDeadlineSeconds"] = max_run
     spec["containers"] = [container]
     if vols:
         spec["volumes"] = vols
@@ -1785,6 +1904,8 @@ def template_body(name, v, state, desc):
             spec["autoDeletionTimeAfterCompletionSeconds"] = int(v["ttl"])
     if (v.get("pull_secret") or "(none)") != "(none)":
         notes.append("the image pull secret is not part of templates")
+    if str(v.get("max_run") or "").strip():
+        notes.append("the max run time is not part of templates")
     ds_by = {asset_name(d): d for d in state.datasources}
     ids = [str((ds_by[n].get("meta") or {}).get("id")) for n in v.get("datasources") or [] if n in ds_by]
     body = {"meta": {"name": name, "scopeType": "project", "scopeId": str(p.get("id")), "description": desc},
@@ -1896,8 +2017,8 @@ def manifest_text(man, project):
 FORM_EMPTY = {"project": "", "template": "(none)", "kind": "training", "name": "", "env": "(custom image)",
               "image": "", "command": "", "compute": "(custom)", "gpu": "none", "gpu_amount": "0.5", "pool": "any",
               "cpu": "", "memory": "", "run_as_me": True, "datasources": [], "pvcs": "", "binds": [], "extra_binds": "", "scratch": "", "shm": "",
-              "env_vars": "", "pull_secret": "(none)", "completions": "1", "ttl": "", "priority": "default",
-              "preempt": "default"}
+              "env_vars": "", "pull_secret": "(none)", "completions": "1", "ttl": "", "max_run": "",
+              "priority": "default", "preempt": "default"}
 
 
 def user_preset_dir():
@@ -2095,6 +2216,8 @@ class Batch(threading.Thread):
                 it["msg"] = first_error(out, err) or "submitted"
                 for n in it.get("names") or []:
                     self.state.add_watch(it["project"], n)
+                    if it.get("max_run"):
+                        self.state.set_limit(it["project"], n, it["max_run"])
                 ok, _, msg = run_hooks("post_submit", "", {
                     "RUNAI_TUI_PROJECT": it["project"], "RUNAI_TUI_NAMES": " ".join(it.get("names") or []),
                     "RUNAI_TUI_FILE": os.path.expanduser(it.get("file") or ""), "RUNAI_TUI_METHOD": it["method"]},
@@ -2989,6 +3112,30 @@ class Tui:
             else:
                 self.put(top + 1 + i, lw + 2, text, self.C.get(style, 0), dw - 4)
 
+    def limit_line(self, w):
+        """-> (text, style) about the workload's max run time, or None when it has none (known)."""
+        with self.st.lock:
+            sec, updated = self.st.max_run(w), self.st.updated
+        if not sec:
+            return None
+        ph = w.get("phase") or ""
+        ran = w.get("totalRunningTimeSeconds") or 0
+        if ph == "Running" and updated:
+            ran += max(0, time.time() - updated)
+        text = f"max run  {dur(sec)}"
+        if ph in TERMINAL:
+            if ph not in DONE_OK and ran >= sec * 0.9:
+                return text + "  ·  stopped: it reached its max run time", "err"
+            return text, None
+        if not ran and ph != "Running":
+            return text + "  ·  counted from when it starts", None
+        left = sec - ran
+        at = datetime.datetime.fromtimestamp(time.time() + max(0, left)).strftime("%H:%M")
+        if left < -120:                          # kubectl could not set it on the pods (see the log)
+            return f"{text}  ·  ran {dur(ran)}  ·  {dur(-left)} over: not applied to its pods", "err"
+        return (f"{text}  ·  ran {dur(ran)}  ·  ~{dur(left)} left (stops ~{at})" if left > 0 else
+                f"{text}  ·  ran {dur(ran)}  ·  stopping now"), "warn" if left < max(300, sec * 0.1) else "info"
+
     def detail_lines(self, w):
         L = []
         ph = w.get("phase") or "?"
@@ -3007,6 +3154,9 @@ class Tui:
                   None))
         L.append((f"created  {w.get('createdAt', '')[:19].replace('T', ' ')} UTC  ·  pending "
                   f"{dur(w.get('totalPendingTimeSeconds'))}  ·  running {dur(w.get('totalRunningTimeSeconds'))}", None))
+        lim = self.limit_line(w)
+        if lim:
+            L.append(lim)
         rp = w.get("requestedPods") or {}
         L.append((f"pods     {w.get('runningPods', 0)} running of {rp.get('parallelism', 1)} "
                   f"(completions {rp.get('completions', '-')})", None))
@@ -3975,6 +4125,7 @@ class Tui:
              ("pull_secret", "Image pull secret", "choice", secrets),
              ("completions", "Completions", "text", None),
              ("ttl", "Keep after end (s)", "text", None),
+             ("max_run", "Max run time", "text", None),
              ("priority", "Priority", "choice", ["default"] + PRIORITIES),
              ("preempt", "Preemptibility", "choice", ["default", "preemptible", "non-preemptible"])]
         hide = set()
@@ -3982,6 +4133,8 @@ class Tui:
             hide.add("gpu_amount")
         if v["kind"] != "training":
             hide |= {"completions", "ttl"}
+        if v["kind"] == "service" and not v.get("max_run"):
+            hide.add("max_run")
         if v["kind"] == "workspace":
             hide |= {"scratch", "shm", "pull_secret"}
             if v["env"] != "(custom image)":
@@ -4424,14 +4577,19 @@ class Tui:
             return False
         if warn and not self.confirm(f"{len(warn)} warning(s): {warn[0][:60]}... submit anyway?"):
             return False
+        try:
+            max_run = parse_duration(v.get("max_run")) if v["kind"] != "service" else None
+        except ValueError:
+            max_run = None
         if man:
             os.makedirs(SUBMITTED, exist_ok=True)
             path = os.path.join(SUBMITTED, f"{v['name']}-{datetime.datetime.now():%Y%m%d-%H%M%S}.yaml")
             with open(path, "w") as f:
                 f.write(manifest_text(man, proj))
-            self.start_batch([{"file": path, "label": v["name"], "project": proj}])
+            self.start_batch([{"file": path, "label": v["name"], "project": proj, "max_run": max_run}])
         else:
-            self.start_batch([{"argv": argv, "label": v["name"], "project": proj, "names": [v["name"]]}])
+            self.start_batch([{"argv": argv, "label": v["name"], "project": proj, "names": [v["name"]],
+                               "max_run": max_run}])
         if go:
             self.after_start = {"project": proj, "name": v["name"], "attach": attach, "t0": time.time()}
         return True

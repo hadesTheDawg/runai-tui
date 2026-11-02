@@ -158,7 +158,9 @@ through it.
 
 The details pane shows phase and progress bar, why it is pending (the
 scheduler's reason), type/category/preemptibility/priority, timings,
-requested vs. allocated resources, node pools, images, tool URLs, the
+requested vs. allocated resources, the max run time with how long it has
+run and roughly how long is left (or that it was stopped at the limit),
+node pools, images, tool URLs, the
 original `runai` command, its pods (node, pool, IP, containers), and the
 phases runai-tui has seen with how long each lasted.
 
@@ -203,6 +205,7 @@ right. Use `↑/↓` to move, `Enter` to edit text or open a list, and `←/→`
 | Env | `A=1,B=2` |
 | Image pull secret | shown when the site lists some (`site.pull_secrets`) |
 | Completions, Keep after end | batch jobs: parallel indexed pods, `ttlSecondsAfterFinished` |
+| Max run time | how long it may run, e.g. `90m`, `2h`, `1h30m`, `1d` (a plain number is seconds); empty = until it ends. Counted from when its pod starts, so time waiting in the queue does not count; then Kubernetes stops it and it shows as *Failed* (`DeadlineExceeded`). Batch and interactive jobs get it in the manifest (`activeDeadlineSeconds` on the pod). The workspace CLI has no flag for it, so runai-tui sets it on the workspace's pod once the pod exists (`kubectl patch`), and again on a pod re-created after a preemption, while runai-tui runs. Not for services, and not saved in Run:ai templates. |
 | Priority, Preemptibility | `default` = Run:ai's default for the kind |
 
 Below the fields: GPU used/quota per pool, plus warnings, e.g. the name is
@@ -439,6 +442,11 @@ TUI.
   id. A role without create permission gets the API's 403 in the status line.
 - PVC sizes come from `kubectl get pvc -n <project namespace>`; without that
   permission only the names from `runai pvc list` are shown.
+- A max run time on a **workspace** needs `get`, `list` and `patch` on pods in the
+  project namespace (`kubectl patch pod … activeDeadlineSeconds`); without
+  them the details pane says it was not applied. Jobs need nothing extra: it is in
+  their manifest. runai-tui remembers the limits it submitted in
+  `~/.local/state/runai-tui/limits.json`.
 - The Run:ai URL comes from `site.control_plane` if a config file sets it, else
   `--cp-url` in `/etc/profile.d/runai-cli.sh`, else `$RUNAI_CP_URL`; the
   optional skeleton kubeconfig and examples from `/usr/local/share/runai`. These and

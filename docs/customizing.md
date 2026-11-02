@@ -133,7 +133,8 @@ form:
   fallback_image: "{registry}/ubuntu:24.04"   # default ubuntu:24.04
   start_preset: default            # if a preset of this name exists, new forms start from it
   priorities: [very-low, low, medium-low, medium, medium-high, high, very-high]
-  defaults: {kind: training, cpu: "0.5", memory: 1Gi, gpu: none, run_as_me: true, ttl: "3600"}
+  defaults: {kind: training, cpu: "0.5", memory: 1Gi, gpu: none, run_as_me: true, ttl: "3600",
+             max_run: ""}                  # max run time, e.g. "8h"; "" = no limit
 ```
 
 **Presets** are saved form values. Press `P` in the form to load one, save

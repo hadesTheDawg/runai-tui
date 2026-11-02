@@ -21,6 +21,7 @@ logged, so it can do nothing the user couldn't do by hand.
 - **PVCs**: browse the project's claims with sizes (`v`) and mount existing ones from the form.
 - **Save to Run:ai** (`M` in the form): the form as a workload template, environment, compute resource or
   data source, visible in the Run:ai UI.
+- **Max run time** in the form (`2h`, `1d`, ...): jobs and workspaces stop after it; the details show the time left.
 - **Quota** by department and project (tab 4) and **AI applications** (tab 5: list, describe, submit, delete).
 - **Colour themes**: Dracula, One Dark Pro, Monokai, Solarized Dark built in, with live
   preview (`T`); import your own VS Code theme `.json`.
