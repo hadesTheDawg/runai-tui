@@ -1,27 +1,25 @@
-# htd-runai: Run:ai from a terminal UI
+# runai-tui: Run:ai from a terminal UI
 
-A how-to for **researchers**. `htd-runai` is a terminal UI (plus a small
+A how-to for **researchers**. `runai-tui` is a terminal UI (plus a small
 command-line mode) on the login node. It sits on top of the `runai` CLI and
 `kubectl`. It does the one-time setup for you, shows your quota, submits
 workloads and follows them until they run, shells into them, and saves them
 as YAML you can submit again.
 
 It runs **as you, with your own Run:ai login**: it can do nothing you could
-not do yourself with `runai` and `kubectl` ([`cli-howto.md`](https://github.com/hadesTheDawg/wwrke2runai-local/blob/main/cli-howto.md)).
+not do yourself with `runai` and `kubectl`.
 Every change it makes is a `runai`/`kubectl` command, written to a log.
-Image management for administrators is a separate tool
-([`htd-images-howto.md`](https://github.com/hadesTheDawg/wwrke2runai-local/blob/main/htd-images-howto.md)).
 
-**Site values used below:**
+**Placeholders used below** (your administrator can tell you yours):
 
-| What | Value here |
+| What | Here |
 |---|---|
-| Login node | `ww1`: `ssh <user>@192.168.65.2` |
-| Tool | `/usr/local/bin/htd-runai` (`./install.sh`, or `runai/48-user-access.sh` in rke2_deploy_ww) |
-| Run:ai URL / your login | `https://runai.htd.local`, `<user>@htd.local` |
+| Login node | `ssh <user>@<login-node>` |
+| Tool | `/usr/local/bin/runai-tui` (`./install.sh`) |
+| Run:ai URL / your login | `https://runai.example.com`, `<you>@example.com` |
 | Your manifests | `~/runai/` (examples, saved workloads) |
-| Manifests submitted from the form | `~/.local/state/htd-runai/submitted/` |
-| Log of every action | `~/.local/state/htd-runai/htd-runai.log` (`!` in the TUI) |
+| Manifests submitted from the form | `~/.local/state/runai-tui/submitted/` |
+| Log of every action | `~/.local/state/runai-tui/runai-tui.log` (`!` in the TUI) |
 
 ---
 
@@ -46,10 +44,10 @@ Image management for administrators is a separate tool
 ## 1. Starting it
 
 ```bash
-ssh <user>@192.168.65.2
-htd-runai                    # opens on Overview, or on Setup if you are not logged in
-htd-runai -p phys-astro      # start in a project
-htd-runai --setup            # start on the Setup tab
+ssh <user>@<login-node>
+runai-tui                    # opens on Overview, or on Setup if you are not logged in
+runai-tui -p team-a      # start in a project
+runai-tui --setup            # start on the Setup tab
 ```
 
 It needs a terminal of at least 80×16. A wide one (≥ 110 columns) puts
@@ -60,18 +58,18 @@ identity, quota and in-flight workloads on one screen.
 ## 2. The screen
 
 ```
- ▲ HTD Researcher · Run:ai   lperez@htd.local              ● runai.htd.local  token 14m36s  updated 4s ago
- 1 Overview    2 Workloads    3 Activity    4 Setup                                  project: phys-astro (p)
-   You                                    Quota · phys-astro
-  Luis Perez                              phys-astro  department physics   1 GPU guaranteed
-  email   lperez@htd.local                pool     GPU used / quota          alloc quota limit  non-pre  CPU  memory
-  uid/gid 5102/5100                       h100     ░░░░░░░░┆░░░░░░░░░░░░░░       0   0.5     2        0    0     0Mi
-  groups  phys-astro                      a100     ██████▌┆░░░░░░░░░░░░░░░     0.5   0.5     2        0    1   3.0Gi
+ ▲ team-a Researcher · Run:ai   jdoe@example.com          ● runai.example.com  token 14m36s  updated 4s ago
+ 1 Overview    2 Workloads    3 Activity    4 Setup                                  project: team-a (p)
+   You                                    Quota · team-a
+  Jane Doe                                team-a  department research          1 GPU guaranteed
+  email   jdoe@example.com                pool     GPU used / quota          alloc quota limit  non-pre  CPU  memory
+  uid/gid 1234/1200                       h100     ░░░░░░░░┆░░░░░░░░░░░░░░       0   0.5     2        0    0     0Mi
+  groups  team-a                      a100     ██████▌┆░░░░░░░░░░░░░░░     0.5   0.5     2        0    1   3.0Gi
   ...
  n new   F submit files   p project   2 workloads   ? help   q quit
 ```
 
-- **Header**: your login, the control plane, how long your current token
+- **Header**: your group (`<group> Researcher`), your login, the control plane, how long your current token
   has left (it renews itself), and when the data was last refreshed. The
   data refreshes every 6 s, or every 2 s while something is in flight.
 - **Tabs** `1`–`4`: Overview, Workloads, Activity, Setup. The Activity tab
@@ -85,22 +83,22 @@ identity, quota and in-flight workloads on one screen.
 
 ## 3. Setup: logging in and housekeeping
 
-Tab `4` is the one-time checklist from [`cli-howto.md` §2](https://github.com/hadesTheDawg/wwrke2runai-local/blob/main/cli-howto.md#2-one-time-setup),
-checked live:
+Tab `4` is the one-time CLI and kubectl setup, as a checklist checked live:
 
 | Check | Fix (Enter) |
 |---|---|
 | runai CLI installed | ask an administrator |
-| CLI points at this site | `runai config set --cp-url=https://runai.htd.local --auto-update=disabled` |
+| CLI points at this site | `runai config set --cp-url=<your Run:ai URL> --auto-update=disabled` |
 | Logged in to Run:ai | log in (below) |
 | Clock in step with Run:ai | tell an administrator (expired-token errors otherwise) |
 | Default project | `runai project set <project>` (pick from yours) |
-| kubectl config file | copy the site skeleton to `~/.kube/config` |
+| kubectl config file | copy the site skeleton to `~/.kube/config` (if the site provides one) |
 | kubectl uses your Run:ai login | `runai kubeconfig set --bypass-validation` |
 | kubectl namespace | `kubectl config set-context --current --namespace=runai-<project>` |
 | kubectl access to your project | `kubectl auth whoami` + `can-i create jobs` (informational) |
-| Your manifests folder | copy the guide's examples into `~/runai`, with your UID/GID/user filled in |
+| Your manifests folder | copy the site's example manifests into `~/runai` (if it provides some) |
 | Home directory | free space, permissions, site UID (informational) |
+| runai-tui configuration | config files in use and any problems in them (`runai-tui config`) |
 
 `Enter` fixes the selected item. `A` fixes everything that needs no input,
 re-checking between rounds, because some fixes only become possible after
@@ -108,9 +106,9 @@ others. `r` re-checks.
 
 **Logging in** (`i`, or Enter on *Logged in*): choose
 
-- *user name and password*: runs `runai login user -u <you>@htd.local` in
+- *user name and password*: runs `runai login user -u <you>@example.com` in
   the terminal. Type the password (same as the web UI), press **Enter**, then
-  **Enter** again on `[ Submit ]`. htd-runai never sees the password.
+  **Enter** again on `[ Submit ]`. runai-tui never sees the password.
 - *single sign-on*: runs `runai login remote-browser`. Open the printed URL
   in a browser on your laptop and paste the code back.
 
@@ -153,14 +151,14 @@ your default project (asks if you have several), and the kubectl namespace.
 Tab `2` lists **your** workloads in the project (`★`). `a` toggles to
 everyone in the project; `/` filters by name, phase, type or image.
 Workloads you created with `kubectl apply` count as yours, even though
-Run:ai records no submitter for them. htd-runai remembers what you submitted
+Run:ai records no submitter for them. runai-tui remembers what you submitted
 through it.
 
 The details pane shows phase and progress bar, why it is pending (the
 scheduler's reason), type/category/preemptibility/priority, timings,
 requested vs. allocated resources, node pools, images, tool URLs, the
 original `runai` command, its pods (node, pool, IP, containers), and the
-phases htd-runai has seen with how long each lasted.
+phases runai-tui has seen with how long each lasted.
 
 | Key | Does |
 |---|---|
@@ -169,7 +167,7 @@ phases htd-runai has seen with how long each lasted.
 | `L` | follow logs live (`runai workload logs -f`); Ctrl-C returns |
 | `d` | `runai workload describe` (events, pods, why pending) |
 | `y` | save as YAML (section 9) |
-| `f` | port-forward a pod port (`kubectl port-forward`); then open `http://localhost:<port>` on the login node, or tunnel it from your laptop with `ssh -L <port>:localhost:<port> <user>@192.168.65.2` |
+| `f` | port-forward a pod port (`kubectl port-forward`); then open `http://localhost:<port>` on the login node, or tunnel it from your laptop with `ssh -L <port>:localhost:<port> <user>@<login-node>` |
 | `u` / `c` | copy the tool URL / the name to your clipboard (works over ssh in most terminals) |
 | `z` | suspend / resume (Run:ai workspaces and trainings) |
 | `x` | delete (`runai workload delete`). Services and Ingresses created by `kubectl apply` stay: `kubectl delete -f <file>` removes those. |
@@ -185,20 +183,26 @@ right. Use `↑/↓` to move, `Enter` to edit text or open a list, and `←/→`
 | Field | Notes |
 |---|---|
 | Project, Name | name: lowercase, digits, `-`, ≤ 63 characters, unique in the project |
+| Template | a Run:ai workload template: fills environment, compute, data sources, command and env vars (shown when your project has templates) |
 | Kind | **batch job**: a `Job` that ends, preemptible (may borrow idle GPUs). **interactive**: a `Job` running `sleep infinity` as a Run:ai *Build* workload, non-preemptible; shell into it with `Enter`. **service**: a `Deployment`. **Run:ai workspace**: `runai workspace submit --environment …`, which keeps the environment's tools and URLs (Jupyter, VS Code, ...). |
 | Environment | an environment from the Run:ai catalog; fills image and command |
 | Image, Command | command runs as `sh -c "<command>"`; empty = the image's default |
+| Compute resource | a Run:ai compute resource: fills CPU, memory and GPU; editing those by hand sets it back to `(custom)` |
 | GPU | none / fraction (`gpu-fraction` annotation) / whole (`nvidia.com/gpu`) |
 | Node pool | `any`, or a GPU type (`runai/node-pool` label) |
 | CPU cores, Memory | requests = limits |
-| Run as me + /home | your UID/GID, NFS `/home` mounted, `HOME` and working directory = your home |
+| Run as me + home | your UID/GID, the shared home (`site.home`, default `/home`) mounted, `HOME` and working directory = your home |
+| Data sources | Run:ai PVC, NFS, host-path and config-map data sources, mounted where they say (`Enter`, then Space to tick) |
+| Bind mounts | host paths from the site's list (e.g. `/etc/passwd`, `/etc/group`), read-only unless the site says otherwise; some may be ticked already |
+| Extra bind mounts | your own host paths: `Enter` opens a list. `a` (or `Enter` on *+ add*) opens a new row in the list where you type the host path (Tab completes), then the path in the container, and the list grows as you add more; `e` edits; `Space` switches read-only / read-write; `d` deletes; `q` returns to the form |
 | Scratch, /dev/shm | node-local `emptyDir` at `/scratch` (sets `TMPDIR`), bigger shared memory |
 | Env | `A=1,B=2` |
+| Image pull secret | shown when the site lists some (`site.pull_secrets`) |
 | Completions, Keep after end | batch jobs: parallel indexed pods, `ttlSecondsAfterFinished` |
 | Priority, Preemptibility | `default` = Run:ai's default for the kind |
 
 Below the fields: GPU used/quota per pool, plus warnings, e.g. the name is
-taken, the image is not in the local registry (nodes are offline), or a
+taken, the image is not in the site registry (when `site.offline_nodes` is on), or a
 non-preemptible GPU request does not fit your free quota and would stay
 pending.
 
@@ -207,13 +211,14 @@ pending.
 | `S` | submit; jumps to Activity (section 8) |
 | `W` | write the manifest to `~/runai/<name>.yaml` (or the workspace command as a `.sh` script) without submitting |
 | `E` | write it, open it in `$EDITOR`, then submit the edited file |
+| `P` | presets: load one, save the form as one, delete one of yours (`~/.config/runai-tui/presets/`); one named `default` fills every new form |
 | `Esc` | discard (asks first) |
 
 Priority, preemptibility and category are written into the manifest as
-labels. htd-runai passes them to `runai workload submit` as `--priority`,
+labels. runai-tui passes them to `runai workload submit` as `--priority`,
 `--preemptibility` and `--category`, because the CLI does not read them from
 the file. A copy of every submitted manifest is kept in
-`~/.local/state/htd-runai/submitted/`.
+`~/.local/state/runai-tui/submitted/`.
 
 ---
 
@@ -242,10 +247,10 @@ Tab `3` shows the batch being submitted and every workload in flight:
   ████████████████████████████████████████████████████████████████████████ 100%
    ✔ 01-cpu-job.yaml  runai workload submit  Creating Job hello-cpu...
    ✔ 03-fractional-gpu.yaml  runai workload submit  Creating Job half-gpu...
-  ▶ ● half-gpu  phys-astro · Job  Running 2s  GPU 0.5
+  ▶ ● half-gpu  team-a · Job  Running 2s  GPU 0.5
     ████████████████████████████████████████████████████▓▓█████░░░░░░░░░░░░░  87%
     Submitted          Pending           Starting           Running           Done
-    ◐ dev-1101-1336  phys-astro · Job  Pending 4s  - NonPreemptibleOverQuota
+    ◐ dev-1101-1336  team-a · Job  Pending 4s  - NonPreemptibleOverQuota
     ███████████████▓▓██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  37%
     Submitted          Pending           Starting           Ready
 ```
@@ -269,8 +274,8 @@ Tab `3` shows the batch being submitted and every workload in flight:
 (you can change the path). The file is a manifest you can submit again:
 
 ```yaml
-# Job dev-1101-1336 in project phys-astro, saved by htd-runai 2026-11-01 13:36:58
-# submit again: runai workload submit -f <this file> -p phys-astro
+# Job dev-1101-1336 in project team-a, saved by runai-tui 2026-11-01 13:36:58
+# submit again: runai workload submit -f <this file> -p team-a
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -283,10 +288,10 @@ spec:
   backoffLimit: 0
   template:
     spec:
-      securityContext: {runAsUser: 5102, runAsGroup: 5100, supplementalGroups: [5100]}
+      securityContext: {runAsUser: 1234, runAsGroup: 1200, supplementalGroups: [1200]}
       containers:
       - name: main
-        image: 10.10.172.1:5001/workloads/ubuntu:24.04
+        image: ubuntu:24.04
         command: [sleep, infinity]
         ...
 ```
@@ -315,11 +320,15 @@ Workloads    ↑↓ move · PgUp/PgDn details · / filter · a mine/everyone
              u copy URL · c copy name · z suspend/resume · x delete
 Activity     ↑↓ · Enter go to · D forget finished (and the workload keys)
 Setup        ↑↓ · Enter fix · A fix all · i log in · o log out · r re-check
-Form         ↑↓ field · Enter/←→ change · S submit · W write · E edit+submit · Esc cancel
+Form         ↑↓ field · Enter/←→ change · S submit · W write · E edit+submit · P presets · Esc cancel
 Pagers       ↑↓ PgUp/PgDn g/G · / search · n next · q back
 ```
 
 Marks: `★` yours · `●` running · `◐` pending/starting · `✔` completed · `✖` failed · `■` stopped.
+
+These are the default keys. They can be remapped (`keys:` in the
+configuration), and `?` always shows the ones in use. See
+[`customizing.md`](customizing.md).
 
 ---
 
@@ -328,19 +337,21 @@ Marks: `★` yours · `●` running · `◐` pending/starting · `✔` completed
 The same functions without the UI, for scripts and quick checks:
 
 ```bash
-htd-runai status                 # identity, quota bars per pool, your workloads
-htd-runai ls                     # your workloads in the default project
-htd-runai ls -A                  # everyone's, in all your projects
-htd-runai doctor                 # setup checklist (exit 1 if anything is not ok)
-htd-runai doctor --fix           # ... and apply the fixes that need no input
-htd-runai submit ~/runai/0[13]-*.yaml          # batch submit with a progress bar, then follow
-htd-runai submit job.yaml -p phys-astro --no-wait
-htd-runai watch [NAME...]        # progress bars until everything has settled (Ctrl-C stops watching)
-htd-runai save NAME [-o FILE|-]  # workload -> YAML (default ~/runai/NAME.yaml; --force overwrites)
-htd-runai shell NAME             # = runai workload exec NAME -it -- bash
+runai-tui status                 # identity, quota bars per pool, your workloads
+runai-tui ls                     # your workloads in the default project
+runai-tui ls -A                  # everyone's, in all your projects
+runai-tui doctor                 # setup checklist (exit 1 if anything is not ok)
+runai-tui doctor --fix           # ... and apply the fixes that need no input
+runai-tui submit ~/runai/0[13]-*.yaml          # batch submit with a progress bar, then follow
+runai-tui submit job.yaml -p team-a --no-wait
+runai-tui watch [NAME...]        # progress bars until everything has settled (Ctrl-C stops watching)
+runai-tui save NAME [-o FILE|-]  # workload -> YAML (default ~/runai/NAME.yaml; --force overwrites)
+runai-tui shell NAME             # = runai workload exec NAME -it -- bash
+runai-tui config                 # configuration in use and where each value comes from
+runai-tui config --defaults      # the built-in defaults as YAML, to start a config file
 ```
 
-Logging in stays interactive: `runai login user -u <you>@htd.local`, or the
+Logging in stays interactive: `runai login user -u <you>@example.com`, or the
 TUI.
 
 ---
@@ -352,33 +363,38 @@ TUI.
 | `✖ not logged in` in the header | session ended: `i` (or `runai login`) |
 | `token is expired` / 401 right after logging in | the login node's clock is off: Setup → *Clock*; tell an administrator |
 | Setup: *kubectl access* fails, `whoami` error | `runai kubeconfig set` (Enter on *kubectl uses your Run:ai login*) |
-| `runai kubeconfig set`: `open /etc/rancher/rke2/rke2.yaml: permission denied` | your shell inherited root's `KUBECONFIG` (`su <user>` without `-`). Log in as yourself (`ssh`, or `su - <user>`). htd-runai ignores such a `KUBECONFIG` and uses `~/.kube/config`; plain `runai`/`kubectl` need `unset KUBECONFIG`. Never use `rke2.yaml`: it is the cluster-admin credential. |
+| `runai kubeconfig set`: `open <root's kubeconfig>: permission denied` | your shell inherited root's `KUBECONFIG` (`su <user>` without `-`). Log in as yourself (`ssh`, or `su - <user>`). runai-tui ignores such a `KUBECONFIG` and uses `~/.kube/config`; plain `runai`/`kubectl` need `unset KUBECONFIG`. Never use root's kubeconfig: it is usually the cluster-admin credential. |
 | Save gives a Run:ai spec, not a manifest | kubectl not set up yet (Setup tab) |
 | Workload stays Pending with `NonPreemptibleOverQuota` | non-preemptible GPU request above your free quota: Overview, *non-pre* column. Use a batch job or preemptible. |
-| `ImagePullBackOff` | image not in `10.10.172.1:5001/workloads/...`; the form warns about this |
+| `ImagePullBackOff` | the nodes cannot pull the image (wrong name, private registry without a pull secret, or offline nodes); set `site.registry` and `site.offline_nodes` and the form warns about this |
 | Shell: `I have no name!` prompt | normal: the image has no passwd entry for your site UID; files and `/home` still work as you |
-| `kubectl apply` workloads not marked `★` on another machine | ownership of kubectl workloads is remembered per user in `~/.local/state/htd-runai/owned.json` |
-| Anything else | `!` shows the log with every command htd-runai ran and its output |
+| `kubectl apply` workloads not marked `★` on another machine | ownership of kubectl workloads is remembered per user in `~/.local/state/runai-tui/owned.json` |
+| Anything else | `!` shows the log with every command runai-tui ran and its output |
 
 ---
 
 ## 13. Notes for administrators
 
-- Installed by `./install.sh` from this repo, or by `runai/48-user-access.sh`
-  in rke2_deploy_ww (both `install -m 755 htd-runai.py /usr/local/bin/htd-runai`). Python 3.9 + PyYAML (system packages), no
+- Installed by `./install.sh` from this repo (`install -m 755 runai-tui.py /usr/local/bin/runai-tui`). Python 3.9 + PyYAML (system packages), no
   other dependencies. It honours `RUNAI_CLI_CONFIG_PATH` and `KUBECONFIG`.
 - Reads use the Run:ai REST API with the user's token from
   `runai auth get-token` (an ExecCredential; `status.token`, 15-minute JWT,
   refreshed by the CLI): `/api/v1/org-unit/projects` (quota, per-pool
   status: CPU in millicores, memory in MB), `/api/v1/workloads`,
-  `/api/v1/workloads/<id>/pods`, `/api/v1/asset/environment`. Researchers
+  `/api/v1/workloads/<id>/pods`, `/api/v1/asset/environment`, and for the
+  form `/api/v1/asset/compute`, `/api/v1/asset/datasources` and
+  `/api/v1/asset/workload-template` (all paths configurable under `api:`). Researchers
   get 403 on `/api/v1/node-pools` and `runai nodepool list`, so cluster-wide
   free capacity is not shown.
-- The site URL comes from `--cp-url` in `/etc/profile.d/runai-cli.sh`; the
-  skeleton kubeconfig and examples from `/usr/local/share/runai`.
+- The Run:ai URL comes from `site.control_plane` if a config file sets it, else
+  `--cp-url` in `/etc/profile.d/runai-cli.sh`, else `$RUNAI_CP_URL`; the
+  optional skeleton kubeconfig and examples from `/usr/local/share/runai`. These and
+  the other site values (registry, CA bundle, home mount, labels, form
+  defaults, keys, colours, submit hooks, plugins) can be set in
+  `/etc/runai-tui/config.yaml`: see [`customizing.md`](customizing.md).
 - Run:ai 3.0.20 quirks it works around: `runai workload submit -f` ignores
   `priorityClassName` / `kai.scheduler/preemptibility` / `run.ai/category`
   labels (passed as flags instead); workloads created by `kubectl apply`
   have `submittedBy: null`.
-- Test hook: `HTD_RUNAI_SCREEN=<file>` writes a plain-text copy of every
+- Test hook: `RUNAI_TUI_SCREEN=<file>` writes a plain-text copy of every
   frame (used to test the UI headlessly through a pty).

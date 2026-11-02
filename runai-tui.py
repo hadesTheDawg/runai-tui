@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""htd-runai: a terminal UI for researchers over the Run:ai CLI (login node).
+"""runai-tui: a terminal UI for researchers over the Run:ai CLI (login node).
 
-The researcher's companion to htd-images: everything runs as you, with your
-own Run:ai login. Reads come from the Run:ai API with your CLI token
+Everything runs as you, with your own Run:ai login. Reads come from the Run:ai API with your CLI token
 (`runai auth get-token`); every change goes through `runai` or `kubectl`, so
 the TUI never does anything you could not do (or repeat) by hand:
 
@@ -19,17 +18,22 @@ the TUI never does anything you could not do (or repeat) by hand:
 
 Usage (on the login node, as yourself):
 
-  htd-runai                         TUI
-  htd-runai status                  identity, quota bars, your workloads
-  htd-runai ls [-A]                 workloads (all users of the project with -A)
-  htd-runai doctor [--fix]          setup checklist (and apply the safe fixes)
-  htd-runai submit FILE... [-p P]   submit manifests, then follow them
-  htd-runai watch [NAME...]         progress bars until everything settles
-  htd-runai save NAME [-o FILE]     workload -> YAML manifest
-  htd-runai shell NAME              shell into a workload
+  runai-tui                         TUI
+  runai-tui status                  identity, quota bars, your workloads
+  runai-tui ls [-A]                 workloads (all users of the project with -A)
+  runai-tui doctor [--fix]          setup checklist (and apply the safe fixes)
+  runai-tui submit FILE... [-p P]   submit manifests, then follow them
+  runai-tui watch [NAME...]         progress bars until everything settles
+  runai-tui save NAME [-o FILE]     workload -> YAML manifest
+  runai-tui shell NAME              shell into a workload
+  runai-tui config [--defaults]     configuration in use (keys, site values, hooks, plugins)
 
-Manifests submitted from the form are kept in ~/.local/state/htd-runai/
-submitted/; actions are logged to ~/.local/state/htd-runai/htd-runai.log.
+Configuration: /etc/runai-tui/config.yaml (site), ~/.config/runai-tui/config.yaml (yours),
+RUNAI_TUI__SECTION__KEY=value; form presets in ~/.config/runai-tui/presets/; plugins in
+/etc/runai-tui/plugins and ~/.config/runai-tui/plugins.
+
+Manifests submitted from the form are kept in ~/.local/state/runai-tui/
+submitted/; actions are logged to ~/.local/state/runai-tui/runai-tui.log.
 """
 import argparse
 import base64
@@ -38,6 +42,7 @@ import curses
 import datetime
 import getpass
 import glob
+import grp
 import json
 import os
 import re
@@ -52,27 +57,224 @@ import textwrap
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import yaml
 
-SHARE = "/usr/local/share/runai"                 # runai/48-user-access.sh
+# --- configuration: built-in defaults < /etc/runai-tui < ~/.config/runai-tui < environment ---------
+# `runai-tui config` shows the merged result and where each value came from;
+# `runai-tui config --defaults` prints this table as a starting point.
+DEFAULTS = {
+    "site": {
+        "name": "{group} Researcher",                # header: "▲ <name> · Run:ai"; {group} {user} {email}
+        "control_plane": "",                         # used when the CLI config and the profile hook have none
+        "ca_file": "",                               # PEM bundle for the control plane; "" = system trust store
+        "share_dir": "/usr/local/share/runai",       # optional: kubeconfig skeleton + examples/*.yaml
+        "profile_hook": "/etc/profile.d/runai-cli.sh",
+        "registry": "",                              # your registry host, e.g. registry.example.com
+        "allowed_registries": ["docker.io/library"],  # pulled without a warning, besides the registry
+        "offline_nodes": False,                      # warn about images outside the registry (air-gapped nodes)
+        "home": {"host_path": "/home", "mount_path": "/home"},   # "Run as me": host_path "" mounts nothing
+        "node_pool_label": "runai/node-pool",
+        "gpu_fraction_annotation": "gpu-fraction",
+        "min_site_uid": 1000,                        # lower UIDs are local accounts, not site users
+        "pull_secrets": [],                          # imagePullSecrets offered in the form
+        # host paths offered as "Bind mounts" in the form, e.g.
+        #   - {name: passwd, host_path: /etc/passwd, type: File, default: true}
+        #   - {name: datasets, host_path: /srv/datasets, mount_path: /data, read_only: false}
+        # mount_path defaults to host_path, read_only to true; type is a hostPath type (File,
+        # Directory, ...; "" = no check); default: true ticks it in every new form
+        "bind_mounts": [],
+        "save_dir": "~/runai",
+        "example_placeholders": {},                  # text in the examples to replace: {uid: "1234", gid: .., user: ..}
+    },
+    "api": {
+        "projects": "/api/v1/org-unit/projects",
+        "workloads": "/api/v1/workloads",
+        "environments": "/api/v1/asset/environment",
+        "computes": "/api/v1/asset/compute",
+        "datasources": "/api/v1/asset/datasources",
+        "templates": "/api/v1/asset/workload-template",
+    },
+    "poll": {
+        "idle": 6, "busy": 2, "logged_out": 15,      # seconds between refreshes
+        "assets": 300,                               # environments, computes, data sources, templates
+        "scope": "project",                          # project: fast refresh of the shown project only; all
+        "full_every": 60,                            # with scope project: every project this often
+        "page_size": 500, "max_workloads": 5000,
+    },
+    "form": {
+        "default_environment": "ubuntu",
+        "fallback_image": "ubuntu:24.04",            # {registry} = site.registry
+        "start_preset": "default",                   # a preset of this name, if any, fills a new form
+        "priorities": ["very-low", "low", "medium-low", "medium", "medium-high", "high", "very-high"],
+        "defaults": {"kind": "training", "command": "echo hello from $(hostname); nproc; sleep 30",
+                     "gpu": "none", "gpu_amount": "0.5", "pool": "any", "cpu": "0.5", "memory": "1Gi",
+                     "run_as_me": True, "scratch": "", "shm": "", "env_vars": "", "completions": "1",
+                     "ttl": "3600", "priority": "default", "preempt": "default"},
+    },
+    "hooks": {
+        "pre_submit": [],    # sh -c commands: manifest on stdin, non-empty stdout replaces it, exit != 0 rejects
+        "post_submit": [],   # sh -c commands after a successful submit (RUNAI_TUI_* variables, no stdin)
+    },
+    "plugins": {"enabled": True, "dirs": ["/etc/runai-tui/plugins", "~/.config/runai-tui/plugins"]},
+    "keys": {},              # action -> key, e.g. {delete: X, shell: s}; see `?` in the TUI for actions
+    "theme": {},             # style -> "fg" or "fg on bg" (names or 0-255), e.g. {brand: 39, head: "white on 22"}
+}
+CONFIG_FILES = ["/etc/runai-tui/config.yaml", "~/.config/runai-tui/config.yaml"]
+PRESET_DIRS = ["/etc/runai-tui/presets", "~/.config/runai-tui/presets"]     # the last one is writable
+
+
+def _merge(base, over, src, sources, path=""):
+    for k, v in over.items():
+        key = f"{path}{k}"
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge(base[k], v, src, sources, key + ".")
+        else:
+            base[k] = v
+            sources[key] = src
+
+
+def load_config():
+    """-> (config, {dotted key: source}, [errors]). Env: RUNAI_TUI_CONFIG=file adds one more file,
+    RUNAI_TUI__SECTION__KEY=value (YAML) sets a single value."""
+    cfg, sources, errors = json.loads(json.dumps(DEFAULTS)), {}, []
+    files = CONFIG_FILES + ([os.environ["RUNAI_TUI_CONFIG"]] if os.environ.get("RUNAI_TUI_CONFIG") else [])
+    for path in files:
+        path = os.path.expanduser(path)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                data = yaml.safe_load(f) or {}
+            if not isinstance(data, dict):
+                raise ValueError("not a mapping")
+            _merge(cfg, data, path, sources)
+        except (OSError, ValueError, yaml.YAMLError) as e:
+            errors.append(f"{path}: {str(e).splitlines()[0]}")
+    for name, raw in sorted(os.environ.items()):
+        if name.startswith("RUNAI_TUI__"):
+            parts = [p.lower() for p in name[len("RUNAI_TUI__"):].split("__") if p]
+            try:
+                val = yaml.safe_load(raw)
+            except yaml.YAMLError:
+                val = raw
+            for p in reversed(parts):
+                val = {p: val}
+            if parts:
+                _merge(cfg, val, f"${name}", sources)
+    for k in ("pre_submit", "post_submit"):
+        if isinstance(cfg["hooks"].get(k), str):
+            cfg["hooks"][k] = [cfg["hooks"][k]] if cfg["hooks"][k].strip() else []
+    return cfg, sources, errors
+
+
+CFG, CFG_SOURCES, CONFIG_ERRORS = load_config()
+SITE = CFG["site"]
+SHARE = SITE["share_dir"]
 SKEL_KUBECONFIG = f"{SHARE}/kubeconfig"
 EXAMPLES = f"{SHARE}/examples"
-PROFILE_HOOK = "/etc/profile.d/runai-cli.sh"
-DEFAULT_CP = "https://runai.htd.local"
-STATE = os.path.expanduser("~/.local/state/htd-runai")
-LOG = os.path.join(STATE, "htd-runai.log")
+PROFILE_HOOK = SITE["profile_hook"]
+DEFAULT_CP = SITE["control_plane"]
+STATE = os.path.expanduser("~/.local/state/runai-tui")
+LOG = os.path.join(STATE, "runai-tui.log")
 SUBMITTED = os.path.join(STATE, "submitted")
-SAVE_DIR = os.path.expanduser("~/runai")
+SAVE_DIR = os.path.expanduser(SITE["save_dir"])
 # by name when on PATH: Run:ai records the command line (shown as "cli" in the UI)
 RUNAI = "runai" if shutil.which("runai") else "/usr/local/bin/runai"
 KUBECTL = "kubectl" if shutil.which("kubectl") else "/usr/local/bin/kubectl"
 NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 MEM_RE = re.compile(r"^\d+(\.\d+)?(Mi|Gi|Ti|M|G|T)$")
 WORKLOAD_KINDS = {"Job", "Deployment", "StatefulSet", "Pod", "ReplicaSet", "CronJob"}
-PRIORITIES = ["very-low", "low", "medium-low", "medium", "medium-high", "high", "very-high"]
+PRIORITIES = CFG["form"]["priorities"]
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+# --- key bindings: (action, default key, where, help) -----------------------------------------
+# where: global (all tabs), workload (Workloads + Activity), workloads, activity, setup, form
+ACTIONS = [
+    ("new", "n", "global", "new workload (form -> YAML -> submit)"),
+    ("submit_files", "F", "global", "submit YAML file(s)"),
+    ("project", "p", "global", "switch project"),
+    ("refresh", "r", "global", "refresh now (re-check on Setup)"),
+    ("log", "!", "global", "action log"),
+    ("help", "?", "global", "this help"),
+    ("quit", "q", "global", "quit"),
+    ("login", "i", "global", "log in"),
+    ("shell", "s", "workload", "shell into it (also Enter on Workloads)"),
+    ("logs", "l", "workload", "logs"),
+    ("follow_logs", "L", "workload", "follow logs (Ctrl-C returns)"),
+    ("describe", "d", "workload", "describe (events)"),
+    ("save", "y", "workload", "save as YAML"),
+    ("port_forward", "f", "workload", "port-forward"),
+    ("copy_url", "u", "workload", "copy URL"),
+    ("copy_name", "c", "workload", "copy name"),
+    ("suspend", "z", "workload", "suspend / resume"),
+    ("delete", "x", "workload", "delete"),
+    ("toggle_mine", "a", "workloads", "mine / everyone in the project"),
+    ("filter", "/", "workloads", "filter"),
+    ("forget_done", "D", "activity", "forget finished entries"),
+    ("fix_all", "A", "setup", "fix everything safe"),
+    ("logout", "o", "setup", "log out"),
+    ("form_submit", "S", "form", "submit"),
+    ("form_write", "W", "form", "write YAML (or a script for workspaces)"),
+    ("form_edit", "E", "form", "edit in $EDITOR, then submit"),
+    ("form_presets", "P", "form", "presets: load / save / delete"),
+]
+# keys a binding may not take: tab numbers, movement, Enter/Tab/Esc/space
+RESERVED = {"main": set("1234jk\t\n\r\x1b "), "form": set("jkhl\t\n\r\x1b q")}
+SCOPE_TABS = {"global": {0, 1, 2, 3}, "workload": {1, 2}, "workloads": {1}, "activity": {2}, "setup": {3}}
+
+
+def parse_key(spec):
+    """'x', 'ctrl-x', 'space' -> the character getch/get_wch returns (or None)."""
+    s = str(spec)
+    if s.lower().startswith("ctrl-") and len(s) == 6:
+        return chr(ord(s[-1].lower()) & 0x1f)
+    return {"space": " "}.get(s.lower(), s if len(s) == 1 else None)
+
+
+def key_name(ch):
+    if ch and ord(ch) < 32:
+        return f"^{chr(ord(ch) + 64)}"
+    return {" ": "Space"}.get(ch, ch or "")
+
+
+def resolve_keys(user, extra=()):
+    """-> ({action: char}, [errors]). A binding that is invalid, reserved or clashes keeps its default."""
+    acts = list(ACTIONS) + list(extra)
+    default = {a: k for a, k, _, _ in acts}
+    keys, errors = dict(default), []
+    where = {a: w for a, _, w, _ in acts}
+    for a, spec in (user or {}).items():
+        ch = parse_key(spec)
+        if a not in keys:
+            errors.append(f"keys.{a}: no such action")
+        elif ch is None:
+            errors.append(f"keys.{a}: '{spec}' is not a key (one character or ctrl-x)")
+        elif ch in RESERVED["form" if where[a] == "form" else "main"]:
+            errors.append(f"keys.{a}: '{spec}' is reserved for movement")
+        else:
+            keys[a] = ch
+    def clash(a, b):
+        return a != b and keys[a] == keys[b] and (where[a] == where[b] == "form" or (
+            "form" not in (where[a], where[b]) and SCOPE_TABS[where[a]] & SCOPE_TABS[where[b]]))
+
+    for a in [a for a in keys if keys[a] != default[a]]:       # a remap that clashes is undone
+        other = next((b for b in keys if clash(a, b)), None)
+        if other:
+            errors.append(f"keys.{a}: '{key_name(keys[a])}' is already {other}; kept '{key_name(default[a])}'")
+            keys[a] = default[a]
+    for a in keys:                                              # still clashing: a remap took a default
+        other = next((b for b in keys if clash(a, b)), None)
+        if other and keys[a] != default[a]:
+            errors.append(f"keys.{a}: clashes with {other}; kept '{key_name(default[a])}'")
+            keys[a] = default[a]
+    return keys, errors
+
+
+KEYS, _key_errors = resolve_keys(CFG.get("keys"))
+CONFIG_ERRORS += _key_errors
 SHELL_CMD = ('cd "${HOME:-/}" 2>/dev/null; '
              'if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi')
 
@@ -286,7 +488,10 @@ def cli_project(cfg=None):
 
 
 def site_url():
-    """The control plane this site's profile hook points the CLI at."""
+    """The control plane: site.control_plane when a config file sets it, else what this site's
+    profile hook points the CLI at, else $RUNAI_CP_URL ("" when none of them says)."""
+    if "site.control_plane" in CFG_SOURCES:
+        return DEFAULT_CP.rstrip("/")
     try:
         m = re.search(r"--cp-url=(\S+)", open(PROFILE_HOOK).read())
         if m:
@@ -301,8 +506,7 @@ ENV_NOTE = ""      # set by sanitize_env(), shown in Setup
 
 def sanitize_env():
     """Drop an inherited KUBECONFIG you cannot read. Typical case: `su <user>` (no '-')
-    from root keeps root's KUBECONFIG=/etc/rancher/rke2/rke2.yaml (cluster admin,
-    root-only); `runai kubeconfig set` then fails with 'permission denied'. Without
+    from root keeps root's KUBECONFIG (a cluster-admin file, root-only); `runai kubeconfig set` then fails with 'permission denied'. Without
     it, runai and kubectl use your own ~/.kube/config, as after a real login."""
     global ENV_NOTE
     kc = os.environ.get("KUBECONFIG", "")
@@ -348,7 +552,12 @@ class Session:
     def __init__(self):
         self.lock = threading.Lock()
         self.tok, self.exp, self.claims = None, 0, {}
-        self.ssl = ssl.create_default_context()
+        ca = os.path.expanduser(SITE.get("ca_file") or "")
+        try:
+            self.ssl = ssl.create_default_context(cafile=ca or None)
+        except (OSError, ssl.SSLError) as e:
+            CONFIG_ERRORS.append(f"site.ca_file {ca}: {e}; using the system trust store")
+            self.ssl = ssl.create_default_context()
         self.server_skew = None            # seconds, server minus local
         self.base = cli_cp_url() or site_url()
 
@@ -378,6 +587,8 @@ class Session:
         return self.claims.get("email") or self.claims.get("preferred_username") or ""
 
     def api(self, path, method="GET", body=None, retry=True):
+        if not self.base:
+            raise ApiError("no Run:ai URL: `runai config set --cp-url=<url>` or site.control_plane (Setup)")
         tok = self.token()
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method, headers={
@@ -454,7 +665,8 @@ class State:
         self.logged_in = None
         self.error = ""
         self.projects, self.workloads = [], []
-        self.envs, self.computes = [], []
+        self.envs, self.computes, self.datasources, self.templates = [], [], [], []
+        self.scope = ""                  # project the TUI shows ("" = all): polled fast with poll.scope project
         self.pods = {}                   # workload id -> (time, [pods] | error str)
         self.focus_id = None
         self.history = {}                # workload id -> [(phase, first seen)]
@@ -496,55 +708,98 @@ class State:
         return out
 
 
+def fetch_workloads(sess, project=None):
+    """All workloads (of one project), a page at a time, up to poll.max_workloads."""
+    pc = CFG["poll"]
+    size, cap = max(1, int(pc["page_size"])), int(pc["max_workloads"])
+    out = []
+    while len(out) < cap:
+        q = {"limit": size, "offset": len(out)}
+        if project:
+            q["filterBy"] = f"projectName=={project}"
+        page = (sess.api(f"{CFG['api']['workloads']}?{urllib.parse.urlencode(q)}") or {}).get("workloads") or []
+        out += page
+        if len(page) < size:
+            break
+    return out
+
+
+def fetch_assets(sess, key):
+    """An asset list (environments, computes, ...); [] when this Run:ai has no such API."""
+    try:
+        return (sess.api(CFG["api"][key]) or {}).get("entries") or []
+    except ApiError:
+        if key == "environments":
+            raise
+        return []
+
+
 class Poller(threading.Thread):
     def __init__(self, sess, state):
         super().__init__(daemon=True)
         self.sess, self.state = sess, state
         self.ev = threading.Event()
         self.assets_at = 0
+        self.full_at = 0
 
     def wake(self):
         self.ev.set()
 
     def run(self):
+        pc = CFG["poll"]
         while True:
             self.poll()
             if self.state.logged_in is False:
-                delay = 15
+                delay = pc["logged_out"]
             else:
-                delay = 2 if self.state.in_flight() else 6
+                delay = pc["busy"] if self.state.in_flight() else pc["idle"]
             self.ev.wait(delay)
             self.ev.clear()
+
+    def scoped(self):
+        """Projects for a fast refresh, or None for all: the shown project plus those with
+        watched workloads still in flight."""
+        st = self.state
+        if CFG["poll"]["scope"] != "project" or not st.scope or not self.full_at \
+                or time.time() - self.full_at > CFG["poll"]["full_every"]:
+            return None
+        with st.lock:
+            return {st.scope} | {p for (p, _), info in st.watch.items() if not info["done_at"]}
 
     def poll(self):
         st, sess = self.state, self.sess
         try:
-            projects = (sess.api("/api/v1/org-unit/projects") or {}).get("projects") or []
-            wls = (sess.api("/api/v1/workloads?limit=500") or {}).get("workloads") or []
-            envs = computes = None
-            if time.time() - self.assets_at > 300:
-                envs = (sess.api("/api/v1/asset/environment") or {}).get("entries") or []
-                try:
-                    computes = (sess.api("/api/v1/asset/compute") or {}).get("entries") or []
-                except ApiError:
-                    computes = []
+            projects = (sess.api(CFG["api"]["projects"]) or {}).get("projects") or []
+            scope = self.scoped()
+            if scope is None:
+                wls = fetch_workloads(sess)
+                self.full_at = time.time()
+            else:
+                fresh = [w for p in sorted(scope) for w in fetch_workloads(sess, p)]
+                with st.lock:
+                    wls = [w for w in st.workloads if w.get("projectName") not in scope] + fresh
+            assets = None
+            if time.time() - self.assets_at > CFG["poll"]["assets"]:
+                assets = {k: fetch_assets(sess, k) for k in ("environments", "computes", "datasources", "templates")}
                 self.assets_at = time.time()
             pods = None
             fid = st.focus_id
             if fid:
                 try:
-                    pods = (sess.api(f"/api/v1/workloads/{fid}/pods") or {}).get("pods") or []
+                    pods = (sess.api(f"{CFG['api']['workloads']}/{fid}/pods") or {}).get("pods") or []
                 except ApiError as e:
                     pods = str(e)
             now = time.time()
+            by_name = lambda e: (e.get("meta") or {}).get("name", "")
             with st.lock:
                 st.me = sess.email
                 st.projects = sorted(projects, key=lambda p: p.get("name", ""))
                 st.workloads = sorted(wls, key=lambda w: w.get("createdAt") or "", reverse=True)
-                if envs is not None:
-                    st.envs = sorted(envs, key=lambda e: e["meta"]["name"])
-                if computes is not None:
-                    st.computes = computes
+                if assets is not None:
+                    st.envs = sorted(assets["environments"], key=by_name)
+                    st.computes = sorted(assets["computes"], key=by_name)
+                    st.datasources = sorted(assets["datasources"], key=by_name)
+                    st.templates = sorted(assets["templates"], key=by_name)
                 if fid:
                     st.pods[fid] = (now, pods)
                 for w in wls:
@@ -736,7 +991,7 @@ def export_workload(sess, w):
             obj = json.loads(out)
             submit_cmd = (obj.get("metadata", {}).get("annotations") or {}).get("runai-submit-command", "")
             man = clean_manifest(obj)
-            head = [f"# {w.get('type')} {name} in project {w.get('projectName')}, saved by htd-runai "
+            head = [f"# {w.get('type')} {name} in project {w.get('projectName')}, saved by runai-tui "
                     f"{datetime.datetime.now():%F %T}",
                     (f"# submit again: kubectl apply -f <this file> -n {ns}   (Services/Ingresses of the "
                      f"original file are not included)" if w.get("source") == "Other" else
@@ -751,7 +1006,7 @@ def export_workload(sess, w):
     kind = {"Workspace": "workspaces", "Training": "trainings", "Inference": "inferences"}.get(w.get("type"))
     if not kind:
         raise RuntimeError("; ".join(e for e in errors if e) or "cannot read the workload with kubectl")
-    spec = sess.api(f"/api/v1/workloads/{kind}/{w['id']}") or {}
+    spec = sess.api(f"{CFG['api']['workloads']}/{kind}/{w['id']}") or {}
     s = spec.get("spec") or {}
     cli = s.get("runaiCliCommand") or next((a.get("value") for a in s.get("annotations") or []
                                             if a.get("name") == "runai-submit-command"), "")
@@ -803,6 +1058,221 @@ def identity():
     return os.getuid(), os.getgid(), getpass.getuser()
 
 
+_GROUP_NAMES = {}
+
+
+def group_name(gid):
+    """gid -> name, cached: the header asks every frame and the lookup may go to LDAP/SSSD."""
+    if gid not in _GROUP_NAMES:
+        try:
+            _GROUP_NAMES[gid] = grp.getgrgid(int(gid)).gr_name
+        except (KeyError, ValueError, OverflowError):
+            _GROUP_NAMES[gid] = ""
+    return _GROUP_NAMES[gid]
+
+
+def user_group(claims):
+    """The user's research group: their primary group if the Run:ai token lists it (or lists
+    none), else the token's first group."""
+    primary = group_name(claims.get("gid") or os.getgid())
+    groups = claims.get("groups") or []
+    return primary if primary in groups or not groups else groups[0]
+
+
+def site_title(claims):
+    """site.name with {group}, {user} and {email} filled in; "{group} Researcher" by default."""
+    vals = {"group": user_group(claims), "user": getpass.getuser(),
+            "email": claims.get("email") or claims.get("preferred_username") or ""}
+    class Keep(dict):
+        def __missing__(self, key):
+            return "{" + key + "}"
+    try:
+        title = SITE["name"].format_map(Keep(vals))
+    except (IndexError, ValueError, AttributeError):
+        title = SITE["name"]
+    return " ".join(title.split()) or "Researcher"
+
+
+# --- Run:ai assets in the form: environments, compute resources, data sources, templates ----------
+def asset_name(a):
+    return (a.get("meta") or {}).get("name", "")
+
+
+def asset_in_scope(a, project):
+    """Usable from this project: project-scoped assets of other projects (and department-scoped
+    ones of other departments) are not."""
+    m = a.get("meta") or {}
+    if not project:
+        return True
+    if m.get("projectId") not in (None, ""):
+        return str(m["projectId"]) == str(project.get("id"))
+    dep = project.get("parentId") or (project.get("parent") or {}).get("id")
+    if m.get("departmentId") not in (None, "") and dep not in (None, ""):
+        return str(m["departmentId"]) == str(dep)
+    return True
+
+
+def compute_values(c):
+    """A compute resource asset -> (form values, note)."""
+    s = c.get("spec") or {}
+    out, note = {}, ""
+    if s.get("cpuCoreRequest") is not None:
+        out["cpu"] = num(float(s["cpuCoreRequest"]))
+    mem = s.get("cpuMemoryRequest")
+    if mem:
+        out["memory"] = str(mem) if MEM_RE.match(str(mem)) else human_mem(mem_bytes(mem))
+    n, typ = s.get("gpuDevicesRequest") or 0, s.get("gpuRequestType") or "portion"
+    portion = s.get("gpuPortionRequest")
+    if not n:
+        out["gpu"] = "none"
+    elif typ != "portion":
+        note = f"GPU request type '{typ}' is not in the form: set GPU by hand"
+    elif portion not in (None, 1, 1.0) and float(portion) < 1:
+        out.update(gpu="fraction", gpu_amount=num(float(portion)))
+        if n > 1:
+            note = f"{n} devices x {num(float(portion))}: the form requests one fraction"
+    else:
+        out.update(gpu="whole", gpu_amount=str(int(n)))
+    if s.get("largeShmRequest"):
+        out["shm"] = out.get("memory") or "1Gi"
+    return out, note
+
+
+DS_KINDS = {"pvc", "nfs", "hostPath", "configMap"}
+
+
+def ds_kind(d):
+    return (d.get("meta") or {}).get("kind") or d.get("kind") or ""
+
+
+def datasource_mount(d, workspace=False):
+    """A data source asset -> (volume, volumeMount) for a manifest, or CLI flags for a workspace.
+    Raises ValueError for kinds the form cannot mount."""
+    kind, s, name = ds_kind(d), d.get("spec") or {}, asset_name(d)
+    vol = "ds-" + re.sub(r"[^a-z0-9-]", "-", name.lower())[:58].strip("-")
+    ro = bool(s.get("readOnly"))
+    if kind == "pvc":
+        claim, path = s.get("claimName"), s.get("path")
+        if not claim or not path:
+            raise ValueError(f"data source {name}: PVC without claimName/path")
+        if workspace:
+            return ["--existing-pvc", f"claimname={claim},path={path}"]
+        return ({"name": vol, "persistentVolumeClaim": {"claimName": claim, **({"readOnly": True} if ro else {})}},
+                {"name": vol, "mountPath": path, **({"readOnly": True} if ro else {})})
+    if kind == "nfs":
+        server, path, mount = s.get("server"), s.get("path"), s.get("mountPath")
+        if not (server and path and mount):
+            raise ValueError(f"data source {name}: NFS without server/path/mountPath")
+        if workspace:
+            return ["--nfs", f"server={server},path={path},mountpath={mount}" + (",readonly" if ro else "")]
+        return ({"name": vol, "nfs": {"server": server, "path": path, **({"readOnly": True} if ro else {})}},
+                {"name": vol, "mountPath": mount, **({"readOnly": True} if ro else {})})
+    if kind == "hostPath":
+        path, mount = s.get("path"), s.get("mountPath")
+        if not (path and mount):
+            raise ValueError(f"data source {name}: host path without path/mountPath")
+        if workspace:
+            return ["--host-path", f"path={path},mount={mount}" + ("" if ro else ",readwrite")]
+        return ({"name": vol, "hostPath": {"path": path}},
+                {"name": vol, "mountPath": mount, **({"readOnly": True} if ro else {})})
+    if kind == "configMap" and not workspace:
+        cm, mount = s.get("configMap"), s.get("mountPath")
+        if not (cm and mount):
+            raise ValueError(f"data source {name}: config map without configMap/mountPath")
+        return {"name": vol, "configMap": {"name": cm}}, {"name": vol, "mountPath": mount, "readOnly": True}
+    raise ValueError(f"data source {name}: kind '{kind}' is not supported here (use the Run:ai UI)")
+
+
+HOSTPATH_TYPES = {"", "File", "Directory", "FileOrCreate", "DirectoryOrCreate", "Socket", "CharDevice",
+                  "BlockDevice"}
+
+
+def site_binds():
+    """site.bind_mounts -> ({name: bind}, [problems]); a bind is {host, path, ro, type}."""
+    out, errs = {}, []
+    for i, b in enumerate(SITE.get("bind_mounts") or []):
+        if isinstance(b, str):
+            b = {"host_path": b}
+        host = str((b or {}).get("host_path") or "")
+        path = str(b.get("mount_path") or host)
+        name = str(b.get("name") or host)
+        typ = str(b.get("type") or "")
+        if not host.startswith("/") or not path.startswith("/"):
+            errs.append(f"site.bind_mounts[{i}]: host_path and mount_path must be absolute")
+        elif typ not in HOSTPATH_TYPES:
+            errs.append(f"site.bind_mounts[{i}]: type '{typ}' is not one of {', '.join(sorted(HOSTPATH_TYPES - {''}))}")
+        else:
+            out[name] = {"host": host, "path": path, "ro": b.get("read_only", True) is not False, "type": typ,
+                         "default": bool(b.get("default"))}
+    return out, errs
+
+
+def parse_binds(text):
+    """'/host[:/container][:ro|rw], ...' -> ([bind], [problems]). Read-only unless :rw."""
+    out, errs = [], []
+    for item in [x.strip() for x in (text or "").split(",") if x.strip()]:
+        parts = item.split(":")
+        mode = "ro"
+        if parts[-1] in ("ro", "rw"):
+            mode = parts.pop()
+        if len(parts) not in (1, 2) or not all(p.startswith("/") for p in parts):
+            errs.append(f"bind '{item}': use /host/path[:/container/path][:ro|rw]")
+            continue
+        out.append({"host": parts[0], "path": parts[-1], "ro": mode == "ro", "type": ""})
+    return out, errs
+
+
+def format_binds(binds):
+    """[bind] -> the '/host[:/container][:rw], ...' text kept in the form and in presets."""
+    return ", ".join(b["host"] + (f":{b['path']}" if b["path"] != b["host"] else "") + ("" if b["ro"] else ":rw")
+                     for b in binds)
+
+
+def form_binds(v):
+    """The form's bind mounts (ticked site ones, then extra ones) -> ([bind], [warnings])."""
+    known, errs = site_binds()
+    binds = [known[n] for n in v.get("binds") or [] if n in known]
+    gone = [n for n in v.get("binds") or [] if n not in known]
+    if gone:
+        errs.append(f"bind mount(s) not in site.bind_mounts: {', '.join(gone)}")
+    extra, bad = parse_binds(v.get("extra_binds"))
+    return binds + extra, errs + bad
+
+
+def template_values(t, state):
+    """A workload template asset -> (form values, notes). Assets are referenced by id."""
+    s = t.get("spec") or {}
+    a = s.get("assets") or {}
+    out, notes = {}, []
+
+    def by_id(items, ref):
+        ref = ref.get("id") if isinstance(ref, dict) else ref
+        return next((x for x in items if str((x.get("meta") or {}).get("id")) == str(ref)), None) if ref else None
+
+    env = by_id(state.envs, a.get("environment"))
+    if env:
+        out["env"] = asset_name(env)
+    elif a.get("environment"):
+        notes.append("its environment is not visible to you")
+    comp = by_id(state.computes, a.get("compute"))
+    if comp:
+        out["compute"] = asset_name(comp)
+    ds = [by_id(state.datasources, r) for r in a.get("datasources") or []]
+    if a.get("datasources"):
+        out["datasources"] = [asset_name(d) for d in ds if d]
+        if None in ds:
+            notes.append(f"{ds.count(None)} data source(s) not visible to you")
+    se = s.get("specificEnv") or {}
+    command = " ".join(x for x in (se.get("command"), se.get("args")) if x)
+    if command:
+        out["command"] = command
+    envs = [f"{e['name']}={e.get('value', '')}" for e in se.get("environmentVariables") or []
+            if e.get("name") and "value" in e]
+    if envs:
+        out["env_vars"] = ",".join(envs)
+    return out, notes
+
+
 def build_workload(v, sess, state):
     """Form values -> (manifest dict or None, argv or None, warnings)."""
     warn = []
@@ -818,8 +1288,9 @@ def build_workload(v, sess, state):
     if not image:
         warn.append("image is empty")
     reg = registry_host(state)
-    if image and reg and not image.startswith(reg + "/") and not image.startswith("docker.io/library/"):
-        warn.append(f"image is not in the local registry ({reg}/workloads/...): compute nodes are offline")
+    ok_regs = ([reg] if reg else []) + list(SITE.get("allowed_registries") or [])
+    if image and reg and SITE.get("offline_nodes") and not any(image.startswith(r + "/") for r in ok_regs):
+        warn.append(f"image is not in the local registry ({reg}/...): compute nodes are offline")
     cpu, mem = v["cpu"].strip(), v["memory"].strip()
     try:
         float(cpu or "0")
@@ -855,7 +1326,20 @@ def build_workload(v, sess, state):
         else:
             k, val = kv.split("=", 1)
             env_vars.append({"name": k.strip(), "value": val})
-    home = f"/home/{user}"
+    hp, hm = SITE["home"].get("host_path") or "", SITE["home"].get("mount_path") or "/home"
+    home = f"{hm.rstrip('/')}/{user}"
+    p_obj = state.project(proj)
+    ds_by = {asset_name(d): d for d in state.datasources}
+    chosen = [ds_by[n] for n in v.get("datasources") or [] if n in ds_by]
+    missing = [n for n in v.get("datasources") or [] if n not in ds_by]
+    if missing:
+        warn.append(f"data source(s) not found: {', '.join(missing)}")
+    chosen_bad = [asset_name(d) for d in chosen if not asset_in_scope(d, p_obj)]
+    if chosen_bad:
+        warn.append(f"not usable from {proj}: {', '.join(chosen_bad)}")
+    pull = v.get("pull_secret") or "(none)"
+    binds, bind_warn = form_binds(v)
+    warn += bind_warn
 
     if kind == "workspace":                      # Run:ai CLI, keeps the environment's tools/URLs
         argv = [RUNAI, "workspace", "submit", name, "-p", proj]
@@ -865,8 +1349,9 @@ def build_workload(v, sess, state):
             argv += ["-i", image]
         if cpu:
             argv += ["--cpu-core-request", cpu]
-        if mem:
-            argv += ["--cpu-memory-request", mem.replace("i", "")]
+        if mem:          # the CLI takes M/G: binary units in whole MB, so 1Gi stays 1Gi (1074M)
+            argv += ["--cpu-memory-request",
+                     mem if not mem.endswith("i") else f"{-(-int(mem_bytes(mem)) // 10 ** 6)}M"]
         if gpu == "whole":
             argv += ["-g", str(int(g or 1))]
         elif gpu == "fraction":
@@ -874,8 +1359,18 @@ def build_workload(v, sess, state):
         if v["pool"] != "any":
             argv += ["--node-pools", v["pool"]]
         if v["run_as_me"]:
-            argv += ["--run-as-user", "--host-path", "path=/home,mount=/home,readwrite",
-                     "--working-dir", home, "-e", f"HOME={home}"]
+            argv += ["--run-as-user"]
+            if hp:
+                argv += ["--host-path", f"path={hp},mount={hm},readwrite", "--working-dir", home, "-e", f"HOME={home}"]
+        for d in chosen:
+            try:
+                argv += datasource_mount(d, workspace=True)
+            except ValueError as e:
+                warn.append(str(e))
+        for b in binds:
+            argv += ["--host-path", f"path={b['host']},mount={b['path']}" + ("" if b["ro"] else ",readwrite")]
+        if pull != "(none)":
+            warn.append("pull secret: not available for CLI workspaces (use an environment with credentials)")
         for e in env_vars:
             argv += ["-e", f"{e['name']}={e['value']}"]
         if v["priority"] != "default":
@@ -904,9 +1399,9 @@ def build_workload(v, sess, state):
         container["resources"] = res
     pod_meta = {}
     if v["pool"] != "any":
-        pod_meta.setdefault("labels", {})["runai/node-pool"] = v["pool"]
+        pod_meta.setdefault("labels", {})[SITE["node_pool_label"]] = v["pool"]
     if gpu == "fraction":
-        pod_meta.setdefault("annotations", {})["gpu-fraction"] = amount
+        pod_meta.setdefault("annotations", {})[SITE["gpu_fraction_annotation"]] = amount
     if kind == "service":
         pod_meta.setdefault("labels", {})["app"] = name
     env = list(env_vars)
@@ -914,10 +1409,24 @@ def build_workload(v, sess, state):
     spec = {}
     if v["run_as_me"]:
         spec["securityContext"] = {"runAsUser": uid, "runAsGroup": gid, "supplementalGroups": [gid]}
-        container["workingDir"] = home
-        env.insert(0, {"name": "HOME", "value": home})
-        mounts.append({"name": "home", "mountPath": "/home"})
-        vols.append({"name": "home", "hostPath": {"path": "/home", "type": "Directory"}})
+        if hp:
+            container["workingDir"] = home
+            env.insert(0, {"name": "HOME", "value": home})
+            mounts.append({"name": "home", "mountPath": hm})
+            vols.append({"name": "home", "hostPath": {"path": hp, "type": "Directory"}})
+    for d in chosen:
+        try:
+            vol, mnt = datasource_mount(d)
+            vols.append(vol)
+            mounts.append(mnt)
+        except ValueError as e:
+            warn.append(str(e))
+    for i, b in enumerate(binds):
+        vol = f"bind-{i}"
+        vols.append({"name": vol, "hostPath": {"path": b["host"], **({"type": b["type"]} if b["type"] else {})}})
+        mounts.append({"name": vol, "mountPath": b["path"], **({"readOnly": True} if b["ro"] else {})})
+    if pull != "(none)":
+        spec["imagePullSecrets"] = [{"name": pull}]
     if v["scratch"].strip():
         if not MEM_RE.match(v["scratch"].strip()):
             warn.append("scratch size: e.g. 10Gi")
@@ -931,6 +1440,12 @@ def build_workload(v, sess, state):
         vols.append({"name": "dshm", "emptyDir": {"medium": "Memory", "sizeLimit": v["shm"].strip()}})
     if env:
         container["env"] = env
+    seen = {}
+    for m in mounts:
+        if m["mountPath"] in seen:
+            warn.append(f"{m['mountPath']} is mounted twice ({seen[m['mountPath']]} and {m['name']}): "
+                        "the pod will be rejected")
+        seen.setdefault(m["mountPath"], m["name"])
     if mounts:
         container["volumeMounts"] = mounts
     if kind != "service":
@@ -970,15 +1485,16 @@ def build_workload(v, sess, state):
                     warn.append("TTL: seconds, e.g. 3600")
         jspec["template"] = template
         man = {"apiVersion": "batch/v1", "kind": "Job", "metadata": meta, "spec": jspec}
+    for name_, fn in PLUGINS.manifest_hooks:
+        try:
+            man = fn(man, dict(v)) or man
+        except Exception as e:
+            warn.append(f"plugin {name_}: {e}")
     return man, None, warn
 
 
 def registry_host(state):
-    for e in state.envs:
-        img = e.get("spec", {}).get("image", "")
-        if "/workloads/" in img:
-            return img.split("/workloads/")[0]
-    return ""
+    return (SITE.get("registry") or "").rstrip("/")
 
 
 def pretty_argv(argv, indent="    "):
@@ -994,9 +1510,138 @@ def pretty_argv(argv, indent="    "):
 
 
 def manifest_text(man, project):
-    head = (f"# Created with htd-runai {datetime.datetime.now():%F %T}\n"
+    head = (f"# Created with runai-tui {datetime.datetime.now():%F %T}\n"
             f"# submit: runai workload submit -f <this file> -p {project}\n")
     return head + yaml.safe_dump(man, sort_keys=False, default_flow_style=False, width=100, allow_unicode=True)
+
+
+# --- form presets: ~/.config/runai-tui/presets/<name>.yaml (site ones in /etc/runai-tui/presets) ---------
+FORM_EMPTY = {"project": "", "template": "(none)", "kind": "training", "name": "", "env": "(custom image)",
+              "image": "", "command": "", "compute": "(custom)", "gpu": "none", "gpu_amount": "0.5", "pool": "any",
+              "cpu": "", "memory": "", "run_as_me": True, "datasources": [], "binds": [], "extra_binds": "", "scratch": "", "shm": "",
+              "env_vars": "", "pull_secret": "(none)", "completions": "1", "ttl": "", "priority": "default",
+              "preempt": "default"}
+
+
+def user_preset_dir():
+    return os.path.expanduser(PRESET_DIRS[-1])
+
+
+def list_presets():
+    """-> {name: path}; your presets override site ones of the same name."""
+    out = {}
+    for d in PRESET_DIRS:
+        for path in sorted(glob.glob(os.path.join(os.path.expanduser(d), "*.yaml"))):
+            out[os.path.basename(path)[:-5]] = path
+    return dict(sorted(out.items()))
+
+
+def read_preset(name):
+    with open(list_presets()[name]) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError("not a mapping of form fields")
+    return data
+
+
+def write_preset(name, v):
+    os.makedirs(user_preset_dir(), exist_ok=True)
+    path = os.path.join(user_preset_dir(), f"{name}.yaml")
+    keep = {k: v[k] for k in FORM_EMPTY if k != "name" and v.get(k) != FORM_EMPTY[k]}
+    with open(path, "w") as f:
+        f.write(f"# runai-tui form preset, saved {datetime.datetime.now():%F %T}\n")
+        yaml.safe_dump(keep, f, sort_keys=False, default_flow_style=False)
+    return path
+
+
+# --- plugins and hooks ---------------------------------------------------------------------
+class Plugins:
+    def __init__(self):
+        self.loaded, self.errors = [], []
+        self.actions = []                # (action id, key, where, label, fn(tui, workload))
+        self.checks = []                 # (plugin, fn(sess, state) -> Check | [Check])
+        self.manifest_hooks = []         # (plugin, fn(manifest, form values) -> manifest)
+
+    def action(self, aid):
+        return next((a for a in self.actions if a[0] == aid), None)
+
+
+PLUGINS = Plugins()
+
+
+class PluginAPI:
+    """Passed to a plugin's register(api). A plugin is a .py file in one of plugins.dirs:
+
+        def register(api):
+            api.action("gpus", "G", "nvidia-smi", lambda tui, w: tui.external(
+                "nvidia-smi", [api.app.RUNAI, "workload", "exec", w["name"], "-p", w["projectName"],
+                               "--", "nvidia-smi"]))
+            api.check(lambda sess, state: api.Check("vpn", "VPN up", "ok", "..."))
+            api.manifest(lambda man, values: man)
+
+    Actions bind a key (remappable as keys.plugin.<file>.<name>); where is workload (Workloads and
+    Activity, fn gets the selected workload), workloads, activity, setup or global (fn gets None)."""
+
+    def __init__(self, name):
+        self.name = name
+        self.app = sys.modules[__name__]
+        self.config = CFG
+        self.Check = Check
+
+    def action(self, name, key, label, fn, where="workload"):
+        if where not in SCOPE_TABS:
+            raise ValueError(f"action {name}: where must be one of {', '.join(SCOPE_TABS)}")
+        PLUGINS.actions.append((f"plugin.{self.name}.{name}", key, where, label, fn))
+
+    def check(self, fn):
+        PLUGINS.checks.append((self.name, fn))
+
+    def manifest(self, fn):
+        PLUGINS.manifest_hooks.append((self.name, fn))
+
+
+def safe_owner(path):
+    """Code we run must be yours or root's, and not writable by anyone else."""
+    st_ = os.stat(path)
+    return st_.st_uid in (0, os.getuid()) and not st_.st_mode & 0o022
+
+
+def load_plugins():
+    global KEYS
+    if not CFG["plugins"].get("enabled"):
+        return
+    import importlib.util
+    for d in CFG["plugins"].get("dirs") or []:
+        d = os.path.expanduser(d)
+        if not os.path.isdir(d):
+            continue
+        for path in sorted(glob.glob(os.path.join(d, "*.py"))):
+            name = os.path.basename(path)[:-3]
+            try:
+                if not (safe_owner(d) and safe_owner(path)):
+                    raise PermissionError("must be owned by you or root and not group/world-writable")
+                spec = importlib.util.spec_from_file_location(f"runai_tui_plugin_{name}", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                mod.register(PluginAPI(name))
+                PLUGINS.loaded.append(path)
+            except Exception as e:
+                PLUGINS.errors.append(f"plugin {path}: {type(e).__name__}: {e}")
+    KEYS, errs = resolve_keys(CFG.get("keys"), [a[:4] for a in PLUGINS.actions])
+    PLUGINS.errors += [e for e in errs if e not in CONFIG_ERRORS]
+
+
+def run_hooks(kind, text="", env=None, label=""):
+    """hooks.<kind> commands in order. pre_submit: text on stdin, non-empty stdout replaces it.
+    -> (ok, text, message)."""
+    for c in CFG["hooks"].get(kind) or []:
+        rc, out, err = cmd(["sh", "-c", c], timeout=120, env=env, stdin=text)
+        log_action(f"hook {kind} {label}", ["sh", "-c", c], rc, err)
+        if rc != 0:
+            return False, text, f"{kind} hook: " + (first_error(err, out) or f"exit {rc}")
+        if kind == "pre_submit" and out.strip():
+            text = out
+    return True, text, ""
 
 
 # --- batch submission ---------------------------------------------------------------------
@@ -1011,9 +1656,29 @@ class Batch(threading.Thread):
 
     def plan(self, it):
         """-> argv; fills it['names'] and it['method'] (raises ValueError when invalid)."""
+        env = {"RUNAI_TUI_PROJECT": it.get("project") or "", "RUNAI_TUI_LABEL": it.get("label") or ""}
         if it.get("argv"):
             it["method"] = "runai workspace submit"
+            ok, _, msg = run_hooks("pre_submit", "", dict(env, RUNAI_TUI_ARGV=json.dumps(it["argv"])),
+                                   it.get("label"))
+            if not ok:
+                raise ValueError(msg)
             return it["argv"]
+        if CFG["hooks"].get("pre_submit"):
+            path = os.path.expanduser(it["file"])
+            try:
+                text = open(path).read()
+            except OSError as e:
+                raise ValueError(f"cannot read: {e}")
+            ok, new, msg = run_hooks("pre_submit", text, dict(env, RUNAI_TUI_FILE=path), it.get("label"))
+            if not ok:
+                raise ValueError(msg)
+            if new != text:              # submit the hook's version, keep it next to the form's manifests
+                os.makedirs(SUBMITTED, exist_ok=True)
+                base = os.path.splitext(os.path.basename(path))[0]
+                it["file"] = os.path.join(SUBMITTED, f"{base}-hooked-{datetime.datetime.now():%Y%m%d-%H%M%S}.yaml")
+                with open(it["file"], "w") as f:
+                    f.write(new)
         try:
             docs = load_docs(it["file"])
         except (OSError, yaml.YAMLError) as e:
@@ -1053,6 +1718,12 @@ class Batch(threading.Thread):
                 it["msg"] = first_error(out, err) or "submitted"
                 for n in it.get("names") or []:
                     self.state.add_watch(it["project"], n)
+                ok, _, msg = run_hooks("post_submit", "", {
+                    "RUNAI_TUI_PROJECT": it["project"], "RUNAI_TUI_NAMES": " ".join(it.get("names") or []),
+                    "RUNAI_TUI_FILE": os.path.expanduser(it.get("file") or ""), "RUNAI_TUI_METHOD": it["method"]},
+                    it.get("label"))
+                if not ok:
+                    it["msg"] += f" ({msg})"
             else:
                 it["state"], it["msg"] = "fail", first_error(err, out) or f"exit {rc}"
             if self.poller:
@@ -1085,7 +1756,11 @@ def copy_examples():
         dst = os.path.join(SAVE_DIR, os.path.basename(src))
         if os.path.exists(dst):
             continue
-        text = open(src).read().replace("5102", str(uid)).replace("5100", str(gid)).replace("lperez", user)
+        text = open(src).read()
+        mine = {"uid": str(uid), "gid": str(gid), "user": user}
+        for k, placeholder in (SITE.get("example_placeholders") or {}).items():
+            if k in mine and placeholder:
+                text = text.replace(str(placeholder), mine[k])
         with open(dst, "w") as f:
             f.write(text)
         done.append(os.path.basename(dst))
@@ -1093,7 +1768,7 @@ def copy_examples():
 
 
 def run_checks(sess, state, cb=None):
-    checks, total = [], 11
+    checks, total = [], 12 + len(PLUGINS.checks)
 
     def add(c):
         checks.append(c)
@@ -1107,13 +1782,18 @@ def run_checks(sess, state, cb=None):
         add(Check("cli", "runai CLI installed", "ok", (out.splitlines() or ["?"])[0] + f"  ({shutil.which('runai')})"))
     else:
         add(Check("cli", "runai CLI installed", "fail", "runai is not on your PATH",
-                  help="Ask an administrator: runai/48-user-access.sh installs /usr/local/bin/runai."))
+                  help="Ask an administrator to install the Run:ai CLI (Run:ai UI: Help > Researcher "
+                       "Command Line Interface)."))
     # 2 control plane URL
     cfg, site = read_cli_config(), site_url()
     cp = cli_cp_url(cfg)
     fix = ("point the CLI at " + site, "cmd", [RUNAI, "config", "set", f"--cp-url={site}", "--auto-update=disabled", "-q"])
-    if cp == site:
+    if cp and (cp == site or not site):
         add(Check("cpurl", "CLI points at this site", "ok", cp))
+    elif not cp and not site:
+        add(Check("cpurl", "CLI points at this site", "fail", "no control plane URL configured",
+                  help="Run `runai config set --cp-url=https://<your Run:ai URL>`, or set site.control_plane "
+                       "in /etc/runai-tui/config.yaml (administrators) or ~/.config/runai-tui/config.yaml."))
     else:
         add(Check("cpurl", "CLI points at this site", "fail" if not cp else "warn",
                   f"configured: {cp or '(nothing)'}; this site: {site}", fix,
@@ -1141,12 +1821,12 @@ def run_checks(sess, state, cb=None):
     else:
         add(Check("clock", "Clock in step with Run:ai", "warn", f"this node is {abs(skew):.0f}s "
                   f"{'behind' if skew > 0 else 'ahead of'} the control plane",
-                  help="Expect 'token is expired' errors. Tell an administrator (ww1 time sync: runai/09-time.sh)."))
+                  help="Expect 'token is expired' errors. Tell an administrator (time sync on this node)."))
     # 5 default project
     projects = []
     if logged:
         try:
-            projects = [p["name"] for p in (sess.api("/api/v1/org-unit/projects") or {}).get("projects") or []]
+            projects = [p["name"] for p in (sess.api(CFG["api"]["projects"]) or {}).get("projects") or []]
         except Exception:
             pass
     proj = cli_project(cfg)
@@ -1226,9 +1906,26 @@ def run_checks(sess, state, cb=None):
         mode = oct(os.stat(home).st_mode & 0o777)
         state_ = "ok" if free > 2 * 1024 ** 3 else "warn"
         add(Check("home", "Home directory", state_, f"{home}: {human_mem(free)} free, mode {mode}, uid {uid}, gid {gid}"
-                  + ("" if uid >= 5000 else "  (not a site user: /home is not mounted into pods as you)")))
+                  + ("" if uid >= SITE["min_site_uid"] else "  (not a site user: /home is not mounted into pods as you)")))
     except OSError as e:
         add(Check("home", "Home directory", "warn", str(e)))
+    # 12 configuration
+    files = sorted({v for v in CFG_SOURCES.values() if not v.startswith("$")})
+    envs = sorted({v for v in CFG_SOURCES.values() if v.startswith("$")})
+    errs = CONFIG_ERRORS + PLUGINS.errors + site_binds()[1]
+    detail = (", ".join(files + envs) or "built-in defaults") + (
+        f"; {len(PLUGINS.loaded)} plugin(s)" if PLUGINS.loaded else "")
+    add(Check("config", "runai-tui configuration", "warn" if errs else "ok",
+              detail + (f"; {len(errs)} problem(s): {errs[0]}" if errs else ""),
+              help="`runai-tui config` shows every value and where it comes from. Problems:\n  "
+                   + "\n  ".join(errs) if errs else "Files: " + ", ".join(CONFIG_FILES)))
+    for name, fn in PLUGINS.checks:
+        try:
+            got = fn(sess, state)
+            for c in got if isinstance(got, list) else [got] if got else []:
+                add(c)
+        except Exception as e:
+            add(Check(f"plugin-{name}", f"plugin {name}", "warn", f"{type(e).__name__}: {e}"))
     return checks
 
 
@@ -1250,39 +1947,63 @@ def apply_fix(check):
 
 
 # --- TUI ---------------------------------------------------------------------------------
-HELP = """\
- htd-runai: Run:ai for researchers
+def help_text():
+    """The help screen, from the key bindings in use (keys: in the config, plugins)."""
+    acts = list(ACTIONS) + [a[:4] for a in PLUGINS.actions]
 
- Everywhere
-   1 2 3 4        Overview · Workloads · Activity · Setup     Tab  next view
-   n              new workload (form -> YAML -> submit)       F    submit YAML file(s)
-   p              switch project                              r    refresh now
-   !              action log                                  ?    this help     q  quit
+    def section(where):
+        return [f"   {key_name(KEYS[a]):<6} {label}" for a, _, w, label in acts if w == where]
 
- Workloads
-   ↑/↓ j/k        move                 PgUp/PgDn  scroll details     /  filter
-   Enter s        shell into it        l  logs        L  follow logs (Ctrl-C returns)
-   d              describe (events)    y  save as YAML (~/runai/<name>.yaml)
-   f              port-forward         u  copy URL    c  copy name
-   z              suspend / resume     x  delete      a  mine / everyone in the project
+    out = [" runai-tui: Run:ai for researchers", "",
+           " Everywhere", "   1-4    Overview · Workloads · Activity · Setup     Tab  next view"] + section("global")
+    out += ["", " Workloads and Activity (the selected workload)",
+            "   ↑/↓ j/k move   PgUp/PgDn scroll details   Enter shell (Workloads) / go to (Activity)"]
+    out += section("workload")
+    out += ["", " Workloads"] + section("workloads")
+    out += ["", " Activity       progress of everything you submitted or have in flight"] + section("activity")
+    out += ["", " Setup          the one-time checklist", "   Enter  fix the selected item"] + section("setup")
+    out += ["", " Form (n)", "   ↑/↓    field     Enter / ←→  edit or change     Esc  cancel"] + section("form")
+    out += ["", " Marks  ★ yours   ● running   ◐ pending/starting   ✔ completed   ✖ failed", "",
+            " Submitting: one object per file -> `runai workload submit -f`; files with several",
+            " objects (Service, Ingress, ...) -> `kubectl apply -f`. Everything is logged to",
+            f" {LOG}.", "",
+            " Customize: keys, colours, site values, form defaults, hooks and plugins in",
+            f" {' and '.join(CONFIG_FILES)}; `runai-tui config` shows them."]
+    return "\n".join(out)
 
- Activity       progress of everything you submitted or have in flight
-   D              forget finished entries
-
- Setup          the one-time checklist
-   Enter          fix the selected item     A  fix everything safe     i  log in     o  log out
-
- Form (n)
-   ↑/↓            field     Enter / ←→  edit or change     S  submit     W  write YAML     E  $EDITOR
-   Esc            cancel
-
- Marks  ★ yours   ● running   ◐ pending/starting   ✔ completed   ✖ failed
-
- Submitting: one object per file -> `runai workload submit -f`; files with several
- objects (Service, Ingress, ...) -> `kubectl apply -f`. Everything is logged to
- ~/.local/state/htd-runai/htd-runai.log."""
 
 TABS = ["Overview", "Workloads", "Activity", "Setup"]
+THEME_STYLES = ["head", "ok", "warn", "info", "err", "sel", "brand", "mag", "dim", "tab"]
+COLOR_NAMES = {"default": -1, "black": 0, "red": 1, "green": 2, "yellow": 3, "blue": 4, "magenta": 5,
+               "cyan": 6, "white": 7}
+
+
+def parse_color(spec):
+    """'green', '208', 'white on 22' -> (fg, bg or None)."""
+    def one(x):
+        x = str(x).strip().lower()
+        if x in COLOR_NAMES:
+            return COLOR_NAMES[x]
+        if x.lstrip("-").isdigit() and -1 <= int(x) <= 255:
+            return int(x)
+        raise ValueError(f"'{x}' is not a colour (a name or 0-255)")
+    fg, _, bg = str(spec).partition(" on ")
+    return one(fg), (one(bg) if bg else None)
+
+
+def theme():
+    """theme: from the config -> {style: (fg, bg or None)}; bad entries are reported in Setup."""
+    out = {}
+    for style, spec in (CFG.get("theme") or {}).items():
+        try:
+            if style not in THEME_STYLES:
+                raise ValueError(f"no such style (styles: {', '.join(THEME_STYLES)})")
+            out[style] = parse_color(spec)
+        except ValueError as e:
+            msg = f"theme.{style}: {e}"
+            if msg not in CONFIG_ERRORS:
+                CONFIG_ERRORS.append(msg)
+    return out
 PHASE_STYLE = {"Running": ("●", "ok"), "Pending": ("◐", "warn"), "Initializing": ("◐", "info"),
                "Creating": ("◐", "info"), "Resuming": ("◐", "info"), "Completed": ("✔", "dim"),
                "Succeeded": ("✔", "dim"), "Failed": ("✖", "err"), "Stopped": ("■", "dim"),
@@ -1303,20 +2024,23 @@ class Tui:
         self.status, self.status_at = "", 0
         self.checks, self.check_progress = [], None
         self.tick = 0
-        self.dump = os.environ.get("HTD_RUNAI_SCREEN")       # test hook: plain-text copy of each frame
+        self.dump = os.environ.get("RUNAI_TUI_SCREEN")       # test hook: plain-text copy of each frame
         self.shadow = {}
         curses.curs_set(0)
         curses.use_default_colors()
         c256 = curses.COLORS >= 256
-        for i, (fg, bg) in enumerate([(curses.COLOR_WHITE, 17 if c256 else curses.COLOR_BLUE),
-                                      (curses.COLOR_GREEN, -1), (curses.COLOR_YELLOW, -1), (curses.COLOR_CYAN, -1),
-                                      (curses.COLOR_RED, -1), (curses.COLOR_BLACK, curses.COLOR_CYAN),
-                                      (208 if c256 else curses.COLOR_YELLOW, -1), (curses.COLOR_MAGENTA, -1),
-                                      (244 if c256 else curses.COLOR_WHITE, -1),
-                                      (curses.COLOR_WHITE, 24 if c256 else curses.COLOR_BLUE)], start=1):
-            curses.init_pair(i, fg, bg)
-        self.C = {k: curses.color_pair(i) for i, k in enumerate(
-            ["head", "ok", "warn", "info", "err", "sel", "brand", "mag", "dim", "tab"], start=1)}
+        pairs = dict(zip(THEME_STYLES, [
+            (curses.COLOR_WHITE, 17 if c256 else curses.COLOR_BLUE), (curses.COLOR_GREEN, -1),
+            (curses.COLOR_YELLOW, -1), (curses.COLOR_CYAN, -1), (curses.COLOR_RED, -1),
+            (curses.COLOR_BLACK, curses.COLOR_CYAN), (208 if c256 else curses.COLOR_YELLOW, -1),
+            (curses.COLOR_MAGENTA, -1), (244 if c256 else curses.COLOR_WHITE, -1),
+            (curses.COLOR_WHITE, 24 if c256 else curses.COLOR_BLUE)]))
+        for style, (fg, bg) in theme().items():         # colours this terminal lacks keep the built-in ones
+            if max(fg, bg if bg is not None else -1) < curses.COLORS:
+                pairs[style] = (fg, pairs[style][1] if bg is None else bg)
+        for i, style in enumerate(THEME_STYLES, start=1):
+            curses.init_pair(i, *pairs[style])
+        self.C = {k: curses.color_pair(i) for i, k in enumerate(THEME_STYLES, start=1)}
         self.C["dim"] |= curses.A_DIM if not c256 else 0
         self.C[None] = 0
         self.C["bold"] = curses.A_BOLD
@@ -1414,12 +2138,12 @@ class Tui:
         self.shadow = {}
         h, w = self.scr.getmaxyx()
         if h < 16 or w < 80:
-            self.put(0, 0, "terminal too small for htd-runai (need 80x16)", self.C["err"])
+            self.put(0, 0, "terminal too small for runai-tui (need 80x16)", self.C["err"])
             self.scr.refresh()
             return
         st = self.st
         who = self.sess.email or "not logged in"
-        head = f" ▲ HTD Researcher · Run:ai   {who}"
+        head = f" ▲ {site_title(self.sess.claims)} · Run:ai   {who}"
         self.put(0, 0, head.ljust(w), self.C["head"] | curses.A_BOLD)
         if st.logged_in is False:
             right = "✖ not logged in (4 → Setup)"
@@ -1455,12 +2179,17 @@ class Tui:
             self.status = ""
         msg = self.status or (st.error and f"⚠ {st.error}") or ""
         self.put(h - 2, 0, msg.ljust(w), self.C["warn"] if msg else 0)
-        keys = {0: [("n", "new"), ("F", "submit files"), ("p", "project"), ("2", "workloads")],
-                1: [("⏎", "shell"), ("l", "logs"), ("d", "describe"), ("y", "save YAML"), ("x", "delete"),
-                    ("a", "mine/all"), ("/", "filter"), ("n", "new")],
-                2: [("⏎", "go to"), ("D", "forget done"), ("n", "new"), ("F", "submit files")],
-                3: [("⏎", "fix"), ("A", "fix all"), ("i", "log in"), ("o", "log out"), ("r", "re-check")]}[self.tab]
-        keys += [("?", "help"), ("q", "quit")]
+        K = lambda a: key_name(KEYS[a])
+        keys = {0: [(K("new"), "new"), (K("submit_files"), "submit files"), (K("project"), "project"),
+                    ("2", "workloads")],
+                1: [("⏎", "shell"), (K("logs"), "logs"), (K("describe"), "describe"), (K("save"), "save YAML"),
+                    (K("delete"), "delete"), (K("toggle_mine"), "mine/all"), (K("filter"), "filter"),
+                    (K("new"), "new")],
+                2: [("⏎", "go to"), (K("forget_done"), "forget done"), (K("new"), "new"),
+                    (K("submit_files"), "submit files")],
+                3: [("⏎", "fix"), (K("fix_all"), "fix all"), (K("login"), "log in"), (K("logout"), "log out"),
+                    (K("refresh"), "re-check")]}[self.tab]
+        keys += [(K("help"), "help"), (K("quit"), "quit")]
         x = 0
         for k, label in keys:
             if x + len(k) + len(label) + 4 > w:
@@ -1842,15 +2571,16 @@ class Tui:
               ("namespace (needed for kubectl apply and YAML export).", "dim")]
         row = top + 1
         for text, style in L:
-            for part in textwrap.wrap(text, dw - 4) or [""]:
+            for part in [p for line in text.split("\n") for p in textwrap.wrap(line, dw - 4) or [""]]:
                 if row >= top + height - 1:
                     return
                 self.put(row, lw + 2, part, self.C.get(style, 0), dw - 4)
                 row += 1
 
     # --- input widgets ---------------------------------------------------------------
-    def prompt(self, label, default="", complete_paths=False, secret=False):
-        """One-line editor on the status line. Esc cancels (None)."""
+    def prompt(self, label, default="", complete_paths=False, secret=False, at=None, redraw=None):
+        """One-line editor on the status line, or at (y, x, width) with the label as given.
+        redraw() repaints behind it after Tab lists matches. Esc cancels (None)."""
         buf = list(default)
         curses.curs_set(1)
         self.scr.timeout(-1)
@@ -1859,10 +2589,18 @@ class Tui:
                 h, w = self.scr.getmaxyx()
                 text = "".join(buf)
                 shown = "*" * len(text) if secret else text
-                line = f"{label}: {shown}"
-                self.put(h - 2, 0, line[-(w - 1):].ljust(w - 1), self.C["info"] | curses.A_BOLD)
-                self.scr.move(h - 2, min(len(line), w - 2))
+                if at:
+                    y, x, width = at
+                    line = f"{label}{shown}"
+                    self.put(y, x, line[-(width - 1):].ljust(width), self.C["sel"] | curses.A_BOLD, width)
+                    self.scr.move(y, x + min(len(line), width - 1))
+                else:
+                    line = f"{label}: {shown}"
+                    self.put(h - 2, 0, line[-(w - 1):].ljust(w - 1), self.C["info"] | curses.A_BOLD)
+                    self.scr.move(h - 2, min(len(line), w - 2))
                 self.scr.refresh()
+                if self.dump:
+                    self.dump_screen()
                 ch = self.scr.get_wch()
                 if ch in ("\n", "\r", curses.KEY_ENTER):
                     return "".join(buf).strip()
@@ -1881,7 +2619,7 @@ class Tui:
                     elif matches:
                         buf = list(text[:len(text) - len(word)] + os.path.commonprefix(matches))
                         self.flash("  ".join(os.path.basename(m.rstrip("/")) for m in matches[:14]))
-                        self.draw()
+                        (redraw or self.draw)()
                 elif isinstance(ch, str) and ch.isprintable():
                     buf.append(ch)
         finally:
@@ -1982,7 +2720,7 @@ class Tui:
         print(f"\n\033[1;{'32' if rc == 0 else '31'}m■ exit {rc}\033[0m", flush=True)
         if pause:
             try:
-                input("[Enter] back to htd-runai ")
+                input("[Enter] back to runai-tui ")
             except EOFError:
                 pass
         curses.reset_prog_mode()
@@ -2023,7 +2761,7 @@ class Tui:
 
     def pick_pod(self, w, running=True):
         try:
-            pods = self.busy("pods ...", lambda: (self.sess.api(f"/api/v1/workloads/{w['id']}/pods") or {})
+            pods = self.busy("pods ...", lambda: (self.sess.api(f"{CFG['api']['workloads']}/{w['id']}/pods") or {})
                              .get("pods") or [])
         except Exception as e:
             self.flash(f"pods: {e}")
@@ -2060,7 +2798,7 @@ class Tui:
         argv = [RUNAI, "workload", "exec", w["name"], "-p", w["projectName"]]
         argv += (["--pod", pod] if pod else []) + (["-c", cont] if cont else [])
         argv += ["-i", "-t", "--wait-timeout", "120s", "--", "sh", "-c", SHELL_CMD]
-        self.external(f"shell in {w['name']}", argv, "exit (or Ctrl-D) returns to htd-runai", pause=False)
+        self.external(f"shell in {w['name']}", argv, "exit (or Ctrl-D) returns to runai-tui", pause=False)
 
     def do_logs(self, follow=False):
         w = self.need_workload()
@@ -2072,7 +2810,7 @@ class Tui:
         argv = [RUNAI, "workload", "logs", w["name"], "-p", w["projectName"]]
         argv += (["--pod", pod] if pod else []) + (["-c", cont] if cont else [])
         if follow:
-            self.external(f"logs of {w['name']}", argv + ["-f", "--timestamps"], "Ctrl-C returns to htd-runai")
+            self.external(f"logs of {w['name']}", argv + ["-f", "--timestamps"], "Ctrl-C returns to runai-tui")
             return
         rc, out, err = self.busy("logs ...", lambda: cmd(argv + ["--tail", "3000"], timeout=60))
         self.pager(f"logs {w['name']}{' / ' + pod if pod else ''}  (L follows)", (out + err) if rc == 0 else
@@ -2237,27 +2975,44 @@ class Tui:
             return
         self.start_batch(items)
 
+    def form_assets(self, v):
+        """Assets usable from the form's project: {kind: [names]}."""
+        p = self.st.project(v["project"])
+        names = lambda items: [asset_name(x) for x in items if asset_in_scope(x, p)]
+        with self.st.lock:
+            return {"env": names(self.st.envs), "compute": names(self.st.computes),
+                    "datasources": [asset_name(d) for d in self.st.datasources
+                                    if asset_in_scope(d, p) and ds_kind(d) in DS_KINDS],
+                    "template": names(self.st.templates)}
+
     def form_fields(self, v):
-        envs = ["(custom image)"] + [e["meta"]["name"] for e in self.st.envs]
+        assets = self.form_assets(v)
         pools = ["any"]
         p = self.st.project(v["project"])
         if p:
             pools += [q["pool"] for q in project_pools(p) if q["pool"] != "default"]
+        secrets = ["(none)"] + list(SITE.get("pull_secrets") or [])
         F = [("project", "Project", "choice", self.projects() or [v["project"]]),
+             ("template", "Template", "choice", ["(none)"] + assets["template"]),
              ("kind", "Kind", "choice", [k for k, _ in KINDS]),
              ("name", "Name", "text", None),
-             ("env", "Environment", "choice", envs),
+             ("env", "Environment", "choice", ["(custom image)"] + assets["env"]),
              ("image", "Image", "text", None),
              ("command", "Command (sh -c)", "text", None),
+             ("compute", "Compute resource", "choice", ["(custom)"] + assets["compute"]),
              ("gpu", "GPU", "choice", ["none", "fraction", "whole"]),
              ("gpu_amount", "  GPU amount", "text", None),
              ("pool", "Node pool", "choice", pools),
              ("cpu", "CPU cores", "text", None),
              ("memory", "Memory", "text", None),
-             ("run_as_me", "Run as me + /home", "bool", None),
+             ("run_as_me", "Run as me + home", "bool", None),
+             ("datasources", "Data sources", "multi", assets["datasources"]),
+             ("binds", "Bind mounts", "multi", list(site_binds()[0])),
+             ("extra_binds", "Extra bind mounts", "binds", None),
              ("scratch", "Scratch /scratch", "text", None),
              ("shm", "/dev/shm size", "text", None),
              ("env_vars", "Env (A=1,B=2)", "text", None),
+             ("pull_secret", "Image pull secret", "choice", secrets),
              ("completions", "Completions", "text", None),
              ("ttl", "Keep after end (s)", "text", None),
              ("priority", "Priority", "choice", ["default"] + PRIORITIES),
@@ -2268,13 +3023,22 @@ class Tui:
         if v["kind"] != "training":
             hide |= {"completions", "ttl"}
         if v["kind"] == "workspace":
-            hide |= {"scratch", "shm"}
+            hide |= {"scratch", "shm", "pull_secret"}
             if v["env"] != "(custom image)":
                 hide |= {"image", "command"}
+        for key in ("template", "compute"):
+            if not assets[key] and v[key] in ("(none)", "(custom)"):
+                hide.add(key)
+        if not assets["datasources"] and not v["datasources"]:
+            hide.add("datasources")
+        if not site_binds()[0] and not v["binds"]:
+            hide.add("binds")
+        if len(secrets) == 1 and v["pull_secret"] == "(none)":
+            hide.add("pull_secret")
         return [f for f in F if f[0] not in hide]
 
     def apply_env(self, v):
-        e = next((x for x in self.st.envs if x["meta"]["name"] == v["env"]), None)
+        e = next((x for x in self.st.envs if asset_name(x) == v["env"]), None)
         if not e:
             return
         s = e.get("spec") or {}
@@ -2282,18 +3046,236 @@ class Tui:
         v["command"] = " ".join(x for x in (s.get("command"), s.get("args")) if x)
         v["run_as_me"] = s.get("uidGidSource") == "fromIdpToken" or v["run_as_me"]
 
+    def apply_compute(self, v):
+        c = next((x for x in self.st.computes if asset_name(x) == v["compute"]), None)
+        if c:
+            vals, note = compute_values(c)
+            v.update(vals)
+            if note:
+                self.flash(f"compute {v['compute']}: {note}")
+
+    def apply_template(self, v):
+        t = next((x for x in self.st.templates if asset_name(x) == v["template"]), None)
+        if not t:
+            return
+        vals, notes = template_values(t, self.st)
+        if vals.get("env"):
+            v["env"] = vals["env"]
+            self.apply_env(v)
+        if vals.get("compute"):
+            v["compute"] = vals["compute"]
+            self.apply_compute(v)
+        for k in ("command", "env_vars", "datasources"):
+            if k in vals:
+                v[k] = vals[k]
+        self.flash(f"template {v['template']} applied" + (f" ({'; '.join(notes)})" if notes else ""))
+
+    def form_defaults(self):
+        proj = self.project or self.projects()[0]
+        v = dict(FORM_EMPTY, **CFG["form"]["defaults"])
+        if v["kind"] not in dict(KINDS):
+            v["kind"] = "training"
+        prefix = {"training": "job", "interactive": "dev", "service": "svc", "workspace": "ws"}[v["kind"]]
+        v.update(project=proj, name=f"{prefix}-{datetime.datetime.now():%m%d-%H%M}")
+        v["binds"] = [n for n, b in site_binds()[0].items() if b["default"]]
+        dflt = next((e for e in self.st.envs if asset_name(e) == CFG["form"]["default_environment"]), None)
+        v["image"] = v.get("image") or (dflt or {}).get("spec", {}).get("image") or \
+            CFG["form"]["fallback_image"].format(registry=registry_host(self.st))
+        start = CFG["form"].get("start_preset")
+        if start and start in list_presets():
+            self.load_preset(v, start)
+        return v
+
+    def load_preset(self, v, name):
+        try:
+            vals = read_preset(name)
+        except (OSError, ValueError, yaml.YAMLError) as e:
+            self.flash(f"preset {name}: {str(e).splitlines()[0]}")
+            return
+        if vals.get("project") not in self.projects():
+            vals.pop("project", None)
+        v.update({k: val for k, val in vals.items() if k in FORM_EMPTY and k != "name"})
+        if v["kind"] not in dict(KINDS):
+            v["kind"] = "training"
+        self.form_changed(v, "kind")
+        self.flash(f"preset {name} loaded")
+
+    def form_presets(self, v):
+        have = list_presets()
+        opts = [f"load: {n}" + ("  (site)" if not p.startswith(user_preset_dir()) else "")
+                for n, p in have.items()]
+        opts += ["save the form as a preset ..."]
+        opts += [f"delete: {n}" for n, p in have.items() if p.startswith(user_preset_dir())]
+        i = self.pick("presets", opts)
+        if i is None:
+            return
+        o = opts[i]
+        if o.startswith("load: "):
+            self.load_preset(v, list(have)[i])
+        elif o.startswith("save"):
+            name = self.prompt("preset name (letters, digits, - and _)",
+                               CFG["form"].get("start_preset") if not have else "")
+            if not name:
+                return
+            if not re.match(r"^[\w-]+$", name):
+                self.flash("preset names: letters, digits, - and _")
+                return
+            if name in have and have[name].startswith(user_preset_dir()) and not self.confirm(
+                    f"overwrite preset {name}?"):
+                return
+            try:
+                self.flash(f"saved preset {name}: {write_preset(name, v)}")
+            except OSError as e:
+                self.flash(f"preset {name}: {e}")
+        else:
+            name = o.split(": ", 1)[1]
+            if self.confirm(f"delete preset {name}?"):
+                os.remove(have[name])
+                self.flash(f"deleted preset {name}")
+
+    def pick_many(self, title, options, chosen):
+        """Modal checklist: Space toggles, Enter accepts, Esc cancels. -> list or None."""
+        if not options:
+            self.flash("nothing to choose from")
+            return None
+        on, sel = [o in chosen for o in options], 0
+        self.scr.timeout(-1)
+        try:
+            while True:
+                h, w = self.scr.getmaxyx()
+                bw = min(w - 4, max(len(title) + 30, max(len(str(o)) for o in options) + 10))
+                bh = min(h - 4, len(options) + 2)
+                y0, x0 = (h - bh) // 2, (w - bw) // 2
+                for i in range(bh):
+                    self.put(y0 + i, x0, " " * bw, 0)
+                self.box(y0, x0, bh, bw, f"{title} (Space toggles, Enter done)", True)
+                top = max(0, sel - (bh - 3))
+                for i, o in enumerate(options[top:top + bh - 2]):
+                    attr = self.C["sel"] | curses.A_BOLD if top + i == sel else 0
+                    self.put(y0 + 1 + i, x0 + 1, f" [{'x' if on[top + i] else ' '}] {o}".ljust(bw - 2), attr, bw - 2)
+                self.scr.refresh()
+                k = self.scr.getch()
+                if k in (27, ord("q")):
+                    return None
+                if k in (10, 13, curses.KEY_ENTER):
+                    return [o for o, x in zip(options, on) if x]
+                if k == ord(" "):
+                    on[sel] = not on[sel]
+                elif k in (curses.KEY_DOWN, ord("j")):
+                    sel = min(len(options) - 1, sel + 1)
+                elif k in (curses.KEY_UP, ord("k")):
+                    sel = max(0, sel - 1)
+        finally:
+            self.scr.timeout(250)
+
+    def edit_binds(self, text):
+        """Modal list of extra bind mounts -> the form text. Rows are typed in place and the box
+        grows with them: a/Enter add, e edit, Space ro/rw, d delete, q done."""
+        binds, _ = parse_binds(text)
+        sel = 0
+        note = "host path is on the compute node; read-only unless [rw]"
+
+        def draw(adding=False, typing=False):
+            """Paint the box (with an empty row to type into when adding) -> row index -> (y, x, width)."""
+            n = len(binds) + 1                   # the "+ add" row, or the row being added
+            h, w = self.scr.getmaxyx()
+            longest = max([len(b["host"]) + len(b["path"]) for b in binds] + [40])
+            bw = min(w - 4, max(72, longest + 20))
+            bh = min(h - 2, n + 5)
+            y0, x0 = (h - bh) // 2, (w - bw) // 2
+            vis = bh - 5
+            top = max(0, min(sel - vis + 1, n - vis))
+            for i in range(bh):
+                self.put(y0 + i, x0, " " * bw, 0)
+            self.box(y0, x0, bh, bw, f"Extra bind mounts ({len(binds)})", True)
+            for j in range(top, min(n, top + vis)):
+                if j < len(binds):
+                    b = binds[j]
+                    line, attr = f" [{'ro' if b['ro'] else 'rw'}] {b['host']}  →  {b['path']}", 0
+                elif adding:
+                    line, attr = "", 0
+                else:
+                    line, attr = " + add a bind mount", self.C["info"]
+                if j == sel and not (adding or typing):
+                    attr = self.C["sel"] | curses.A_BOLD
+                self.put(y0 + 1 + j - top, x0 + 1, line.ljust(bw - 2), attr, bw - 2)
+            msg = self.status
+            self.put(y0 + bh - 3, x0 + 2, msg or note, self.C["warn" if msg else "dim"], bw - 4)
+            if adding or typing:
+                hint = "⏎ next  Tab completes  Esc cancels"
+            elif sel < len(binds):
+                hint = "a/⏎ add  e edit  Space ro/rw  d delete  q done"
+            else:
+                hint = "⏎ add  q done"
+            self.put(y0 + bh - 2, x0 + 2, hint, self.C["dim"], bw - 4)
+            self.scr.refresh()
+            if self.dump:
+                self.dump_screen()
+            return lambda j: (y0 + 1 + j - top, x0 + 2, bw - 4)
+
+        def ask(j, b=None):
+            """Type a bind into row j (b: the one being edited) -> bind or None."""
+            adding = b is None
+            mode = "[ro] " if adding or b["ro"] else "[rw] "
+            pos = draw(adding, True)(j)
+            host = self.prompt(f"{mode}host path: ", b["host"] if b else "/", complete_paths=True, at=pos,
+                               redraw=lambda: draw(adding, True))
+            self.status = ""
+            if not host:
+                return None
+            if not host.startswith("/") or ":" in host or "," in host:
+                self.flash(f"'{host}': an absolute path without ':' or ','")
+                return None
+            pos = draw(adding, True)(j)
+            # same path as the host unless this bind already mounted somewhere else
+            path = self.prompt(f"{mode}{host}  →  ", b["path"] if b and b["path"] != b["host"] else host,
+                               at=pos, redraw=lambda: draw(adding, True))
+            self.status = ""
+            if not path:
+                return None
+            if not path.startswith("/") or ":" in path or "," in path:
+                self.flash(f"'{path}': an absolute path without ':' or ','")
+                return None
+            return {"host": host, "path": path, "ro": b["ro"] if b else True, "type": ""}
+
+        self.scr.timeout(-1)
+        try:
+            while True:
+                sel = max(0, min(sel, len(binds)))
+                draw()
+                k = self.scr.getch()
+                self.status = ""
+                if k in (27, ord("q")):
+                    return format_binds(binds)
+                if k in (curses.KEY_DOWN, ord("j")):
+                    sel += 1
+                elif k in (curses.KEY_UP, ord("k")):
+                    sel -= 1
+                elif k == ord("a") or (k in (10, 13, curses.KEY_ENTER) and sel == len(binds)):
+                    sel = len(binds)
+                    b = ask(sel)
+                    if b:
+                        binds.append(b)
+                        sel = len(binds)             # straight on to the next "+ add"
+                elif sel < len(binds) and k in (ord("e"), 10, 13, curses.KEY_ENTER):
+                    b = ask(sel, binds[sel])
+                    if b:
+                        binds[sel] = b
+                elif sel < len(binds) and k == ord(" "):
+                    binds[sel]["ro"] = not binds[sel]["ro"]
+                elif sel < len(binds) and k in (ord("d"), ord("x"), curses.KEY_DC):
+                    del binds[sel]
+                self.scr.timeout(-1)
+        finally:
+            self.scr.timeout(250)
+
     def do_new(self):
         if not self.st.projects:
             self.flash("no projects loaded yet (logged in? see Setup)")
             return
-        proj = self.project or self.projects()[0]
-        v = {"project": proj, "kind": "training", "name": f"job-{datetime.datetime.now():%m%d-%H%M}",
-             "env": "(custom image)", "image": "", "command": "echo hello from $(hostname); nproc; sleep 30",
-             "gpu": "none", "gpu_amount": "0.5", "pool": "any", "cpu": "0.5", "memory": "1Gi", "run_as_me": True,
-             "scratch": "", "shm": "", "env_vars": "", "completions": "1", "ttl": "3600",
-             "priority": "default", "preempt": "default"}
-        ubuntu = next((e for e in self.st.envs if e["meta"]["name"] == "ubuntu"), None)
-        v["image"] = (ubuntu or {}).get("spec", {}).get("image") or (registry_host(self.st) + "/workloads/ubuntu:24.04")
+        v = self.form_defaults()
+        acts = {KEYS["form_submit"]: "S", KEYS["form_write"]: "W", KEYS["form_edit"]: "E",
+                KEYS["form_presets"]: "P"}
         sel, pscroll = 0, 0
         self.scr.timeout(-1)
         try:
@@ -2327,11 +3309,20 @@ class Tui:
                         i = choices.index(v[key]) if v[key] in choices else 0
                         v[key] = choices[(i + (-1 if k in (curses.KEY_LEFT, "h") else 1)) % len(choices)]
                         self.form_changed(v, key)
+                elif k in ("\n", "\r", curses.KEY_ENTER, " ") and typ == "binds":
+                    v[key] = self.edit_binds(v[key])
+                    self.scr.timeout(-1)
+                elif k in ("\n", "\r", curses.KEY_ENTER, " ") and typ == "multi":
+                    got = self.pick_many(fields[sel][1].strip(), choices, v[key])
+                    self.scr.timeout(-1)
+                    if got is not None:
+                        v[key] = got
                 elif k in ("\n", "\r", curses.KEY_ENTER):
                     if typ == "text":
                         new = self.prompt(fields[sel][1].strip(), v[key])
                         if new is not None:
                             v[key] = new
+                            self.form_changed(v, key)
                         self.scr.timeout(-1)
                     elif typ == "bool":
                         v[key] = not v[key]
@@ -2341,16 +3332,25 @@ class Tui:
                         if i is not None:
                             v[key] = choices[i]
                             self.form_changed(v, key)
-                elif k in ("S", "W", "E"):
-                    if self.form_action(k, v, man, argv, warn):
+                elif acts.get(k) == "P":
+                    self.form_presets(v)
+                    self.scr.timeout(-1)
+                elif acts.get(k):
+                    if self.form_action(acts[k], v, man, argv, warn):
                         return
                     self.scr.timeout(-1)
         finally:
             self.scr.timeout(250)
 
     def form_changed(self, v, key):
+        if key == "template" and v["template"] != "(none)":
+            self.apply_template(v)
         if key == "env" and v["env"] != "(custom image)":
             self.apply_env(v)
+        if key == "compute" and v["compute"] != "(custom)":
+            self.apply_compute(v)
+        if key in ("gpu", "gpu_amount", "cpu", "memory") and v["compute"] != "(custom)":
+            v["compute"] = "(custom)"            # edited by hand: no longer that compute resource
         if key == "kind":
             prefix = {"training": "job", "interactive": "dev", "service": "svc", "workspace": "ws"}[v["kind"]]
             if re.match(r"^(job|dev|svc|ws)-\d{4}-\d{4}$", v["name"]):
@@ -2374,11 +3374,11 @@ class Tui:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "w") as f:
                 f.write(manifest_text(man, proj) if man else
-                        "#!/bin/sh\n# htd-runai: Run:ai workspace\n" + pretty_argv(argv, "  ") + "\n")
+                        "#!/bin/sh\n# runai-tui: Run:ai workspace\n" + pretty_argv(argv, "  ") + "\n")
             if not man:
                 os.chmod(path, 0o755)
             if k == "W":
-                self.flash(f"wrote {path}" + ("; F submits it" if man else ""))
+                self.flash(f"wrote {path}" + (f"; {key_name(KEYS['submit_files'])} submits it" if man else ""))
                 return True
             editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
             curses.def_prog_mode()
@@ -2394,10 +3394,11 @@ class Tui:
             if self.confirm(f"submit {path}?", True):
                 self.start_batch([{"file": path, "label": os.path.basename(path), "project": proj}])
             else:
-                self.flash(f"kept {path}; F submits it later")
+                self.flash(f"kept {path}; {key_name(KEYS['submit_files'])} submits it later")
             return True
         if k == "E":
-            self.flash("E edits manifests; this kind is a CLI command (W writes it as a script)")
+            self.flash(f"{key_name(KEYS['form_edit'])} edits manifests; this kind is a CLI command "
+                       f"({key_name(KEYS['form_write'])} writes it as a script)")
             return False
         blocking = [x for x in warn if "already exists" in x or x.startswith(("name:", "image is empty"))]
         if blocking:
@@ -2423,22 +3424,28 @@ class Tui:
         lw = max(52, w * 46 // 100)
         fh = h - 3
         self.box(1, 0, fh, lw, "Fields", True)
-        for i, (key, label, typ, choices) in enumerate(fields[:fh - 2]):
+        ftop = max(0, sel - (fh - 3))
+        for i, (key, label, typ, choices) in enumerate(fields[ftop:ftop + fh - 2]):
             val = v[key]
-            if typ == "bool":
+            if typ == "multi":
+                val = ", ".join(val) or "(none)"
+            elif typ == "binds":
+                n = len(parse_binds(val)[0])
+                val = f"{n}: {val}" if n else "(none) - Enter to add"
+            elif typ == "bool":
                 val = "[x] yes" if val else "[ ] no"
             elif key == "kind":
                 val = dict(KINDS)[val]
             elif typ == "choice":
                 val = f"‹ {val} ›"
             line = f"{label:<20} {val}"
-            if i == sel:
+            if ftop + i == sel:
                 self.put(2 + i, 1, f" {line}".ljust(lw - 2), self.C["sel"] | curses.A_BOLD, lw - 2)
             else:
                 self.put(2 + i, 2, f"{label:<20}", self.C["dim"], lw - 4)
                 self.put(2 + i, 23, str(val), 0, lw - 25)
         # quota hint + warnings below the fields
-        row = 2 + len(fields) + 1
+        row = 2 + min(len(fields) - ftop, fh - 2) + 1
         p = self.st.project(v["project"])
         if p and row < fh:
             qs = [f"{q['pool']} {num(q['gpu'])}/{num(q['quota'])}" for q in project_pools(p) if pool_visible(q)]
@@ -2459,10 +3466,13 @@ class Tui:
             style = "dim" if l.lstrip().startswith("#") else (
                 "info" if re.match(r"^\s*-?\s*[\w./-]+:", l) else None)
             self.put(2 + i, lw + 2, l, self.C.get(style, 0), pw - 4)
-        keys = [("↑↓", "field"), ("⏎ ←→", "change"), ("S", "submit"), ("W", "write YAML"), ("E", "edit+submit"),
-                ("Esc", "cancel")]
+        K = lambda a: key_name(KEYS[a])
+        keys = [("↑↓", "field"), ("⏎ ←→", "change"), (K("form_submit"), "submit"), (K("form_write"), "write YAML"),
+                (K("form_edit"), "edit+submit"), (K("form_presets"), "presets"), ("Esc", "cancel")]
         x = 0
         for k, label in keys:
+            if x + len(k) + len(label) + 4 > w:
+                break
             self.put(h - 1, x, f" {k} ", self.C["sel"] | curses.A_BOLD)
             self.put(h - 1, x + len(k) + 2, f"{label} ", 0)
             x += len(k) + len(label) + 4
@@ -2568,7 +3578,7 @@ class Tui:
         """The housekeeping the guide lists after `runai login`, with a progress bar."""
         try:
             self.sess.token(force=True)
-            projects = [p["name"] for p in (self.sess.api("/api/v1/org-unit/projects") or {}).get("projects") or []]
+            projects = [p["name"] for p in (self.sess.api(CFG["api"]["projects"]) or {}).get("projects") or []]
         except Exception as e:
             self.flash(f"logged in, but: {e}")
             projects = []
@@ -2626,18 +3636,19 @@ class Tui:
             if first_login_check and self.st.logged_in is False:
                 first_login_check = False
                 self.tab = 3
-                self.flash("not logged in: i logs you in (or Enter on the ✖ items)")
+                self.flash(f"not logged in: {key_name(KEYS['login'])} logs you in (or Enter on the ✖ items)")
             elif first_login_check and self.st.logged_in:
                 first_login_check = False
             if not self.project and self.st.projects and cli_project():
                 self.project = cli_project()
+            if self.st.scope != self.project:
+                self.st.scope = self.project
+                self.poller.wake()
             self.draw()
             k = self.scr.getch()
             if k == -1:
                 continue
             h = self.scr.getmaxyx()[0]
-            if k in (ord("q"),):
-                return
             if k == 27:
                 continue
             if ord("1") <= k <= ord("4"):
@@ -2646,24 +3657,6 @@ class Tui:
                 self.tab = (self.tab + 1) % len(TABS)
             elif k == curses.KEY_BTAB:
                 self.tab = (self.tab - 1) % len(TABS)
-            elif k == ord("?"):
-                self.pager("htd-runai help", HELP)
-            elif k == ord("!"):
-                self.show_log()
-            elif k == ord("r"):
-                self.poller.wake()
-                if self.tab == 3:
-                    self.recheck()
-                else:
-                    self.flash("refreshing ...")
-            elif k == ord("p"):
-                self.switch_project()
-            elif k == ord("n"):
-                self.do_new()
-            elif k == ord("F"):
-                self.do_submit_files()
-            elif k == ord("i"):
-                self.do_login()
             elif self.tab in (1, 2) and k in (curses.KEY_DOWN, ord("j")):
                 self.sel["wl" if self.tab == 1 else "act"] += 1
             elif self.tab in (1, 2) and k in (curses.KEY_UP, ord("k")):
@@ -2677,66 +3670,117 @@ class Tui:
                 self.dscroll += h - 8
             elif self.tab == 1 and k == curses.KEY_PPAGE:
                 self.dscroll = max(0, self.dscroll - (h - 8))
-            elif self.tab == 1 and k in (10, 13, curses.KEY_ENTER, ord("s")):
+            elif self.tab == 1 and k in (10, 13, curses.KEY_ENTER):
                 self.do_shell()
             elif self.tab == 2 and k in (10, 13, curses.KEY_ENTER):
-                w = self.need_workload()
-                if w:
-                    ws = self.visible_workloads()
-                    if w not in ws:
-                        self.mine, self.filter, self.project = False, "", w.get("projectName")
-                        ws = self.visible_workloads()
-                    self.sel["wl"] = next((i for i, x in enumerate(ws) if x.get("id") == w.get("id")), 0)
-                    self.tab = 1
-            elif self.tab == 2 and k == ord("D"):
-                with self.st.lock:
-                    for key, info in list(self.st.watch.items()):
-                        wl = self.st.find(*key)
-                        if wl is None or settled(wl):
-                            del self.st.watch[key]
-                    if self.st.batch and self.st.batch.done:
-                        self.st.batch = None
-                self.sel["act"] = 0
-            elif self.tab in (1, 2) and k == ord("l"):
-                self.do_logs()
-            elif self.tab in (1, 2) and k == ord("L"):
-                self.do_logs(follow=True)
-            elif self.tab in (1, 2) and k == ord("d"):
-                self.do_describe()
-            elif self.tab in (1, 2) and k == ord("y"):
-                self.do_save()
-            elif self.tab in (1, 2) and k == ord("x"):
-                self.do_delete()
-            elif self.tab in (1, 2) and k == ord("z"):
-                self.do_suspend()
-            elif self.tab in (1, 2) and k == ord("f"):
-                self.do_port_forward()
-            elif self.tab in (1, 2) and k == ord("u"):
-                self.do_copy("url")
-            elif self.tab in (1, 2) and k == ord("c"):
-                self.do_copy("name")
-            elif self.tab == 2 and k == ord("s"):
-                self.do_shell()
-            elif self.tab == 1 and k == ord("a"):
-                self.mine = not self.mine
-                self.sel["wl"] = self.top["wl"] = 0
-            elif self.tab == 1 and k == ord("/"):
-                f = self.prompt("filter (name, phase, type, image)", self.filter)
-                if f is not None:
-                    self.filter = f
-                    self.sel["wl"] = self.top["wl"] = 0
+                self.go_to_workload()
             elif self.tab == 3 and k in (10, 13, curses.KEY_ENTER):
                 if self.checks:
                     self.do_fix(self.checks[min(self.sel["setup"], len(self.checks) - 1)])
-            elif self.tab == 3 and k == ord("A"):
-                self.fix_all()
-            elif self.tab == 3 and k == ord("o"):
-                self.do_logout()
+            elif 0 <= k < 0x110000:
+                if self.dispatch(chr(k)) == "quit":
+                    return
+
+    def dispatch(self, ch):
+        """Run the action bound to ch on this tab (keys: in the config; plugins add their own)."""
+        where = {a: w for a, _, w, _ in ACTIONS}
+        where.update({a[0]: a[2] for a in PLUGINS.actions})
+        act = next((a for a, w in where.items() if w != "form" and KEYS.get(a) == ch
+                    and self.tab in SCOPE_TABS[w]), None)
+        if not act:
+            return None
+        plugin = PLUGINS.action(act)
+        if plugin:
+            w = None
+            if plugin[2] in ("workload", "workloads", "activity"):
+                w = self.need_workload()
+                if not w:
+                    return act
+            try:
+                plugin[4](self, w)
+            except Exception as e:
+                self.flash(f"{act}: {type(e).__name__}: {e}")
+            return act
+        handlers = {
+            "quit": lambda: None,
+            "help": lambda: self.pager("runai-tui help", help_text()),
+            "log": self.show_log,
+            "refresh": self.refresh,
+            "project": self.switch_project,
+            "new": self.do_new,
+            "submit_files": self.do_submit_files,
+            "login": self.do_login,
+            "shell": self.do_shell,
+            "logs": self.do_logs,
+            "follow_logs": lambda: self.do_logs(follow=True),
+            "describe": self.do_describe,
+            "save": self.do_save,
+            "delete": self.do_delete,
+            "suspend": self.do_suspend,
+            "port_forward": self.do_port_forward,
+            "copy_url": lambda: self.do_copy("url"),
+            "copy_name": lambda: self.do_copy("name"),
+            "toggle_mine": self.toggle_mine,
+            "filter": self.set_filter,
+            "forget_done": self.forget_done,
+            "fix_all": self.fix_all,
+            "logout": self.do_logout,
+        }
+        handlers[act]()
+        return act
+
+    def refresh(self):
+        self.poller.wake()
+        if self.tab == 3:
+            self.recheck()
+        else:
+            self.flash("refreshing ...")
+
+    def go_to_workload(self):
+        w = self.need_workload()
+        if w:
+            ws = self.visible_workloads()
+            if w not in ws:
+                self.mine, self.filter, self.project = False, "", w.get("projectName")
+                ws = self.visible_workloads()
+            self.sel["wl"] = next((i for i, x in enumerate(ws) if x.get("id") == w.get("id")), 0)
+            self.tab = 1
+
+    def forget_done(self):
+        with self.st.lock:
+            for key, info in list(self.st.watch.items()):
+                wl = self.st.find(*key)
+                if wl is None or settled(wl):
+                    del self.st.watch[key]
+            if self.st.batch and self.st.batch.done:
+                self.st.batch = None
+        self.sel["act"] = 0
+
+    def toggle_mine(self):
+        self.mine = not self.mine
+        self.sel["wl"] = self.top["wl"] = 0
+
+    def set_filter(self):
+        f = self.prompt("filter (name, phase, type, image)", self.filter)
+        if f is not None:
+            self.filter = f
+            self.sel["wl"] = self.top["wl"] = 0
 
 
 # --- command-line mode -----------------------------------------------------------------------
 ANSI = {"ok": "32", "warn": "33", "info": "36", "err": "31", "dim": "2", "brand": "38;5;208", "pulse": "1;38;5;208",
         "bold": "1", None: "0", "fill": "32", "empty": "2"}
+
+
+def _ansi_theme():
+    for style, (fg, _) in theme().items():
+        code = "39" if fg < 0 else f"3{fg}" if fg < 8 else f"38;5;{fg}"
+        ANSI[style] = code
+        if style == "brand":
+            ANSI["pulse"] = "1;" + code
+
+
+_ansi_theme()
 
 
 def ansi(text, style):
@@ -2753,7 +3797,7 @@ def cli_session(require_login=True):
         try:
             sess.token()
         except NotLoggedIn as e:
-            sys.exit(f"not logged in: {e}\n  run `htd-runai` (Setup tab) or `runai login user -u <you>@<site>`")
+            sys.exit(f"not logged in: {e}\n  run `runai-tui` (Setup tab) or `runai login user -u <you>@<site>`")
     return sess, st
 
 
@@ -2955,13 +3999,51 @@ def cli_shell(args):
     os.execvp(argv[0], argv)
 
 
+def cli_config(args):
+    if args.defaults:
+        print("# runai-tui configuration: copy what you change to ~/.config/runai-tui/config.yaml\n"
+              "# (yours) or /etc/runai-tui/config.yaml (the site's).")
+        sys.stdout.write(yaml.safe_dump(DEFAULTS, sort_keys=False, default_flow_style=False, width=100))
+        return
+    load_plugins()
+    print(ansi("files", "brand"))
+    for f in CONFIG_FILES + ([os.environ["RUNAI_TUI_CONFIG"]] if os.environ.get("RUNAI_TUI_CONFIG") else []):
+        there = os.path.exists(os.path.expanduser(f))
+        print(f"  {ansi('✔', 'ok') if there else ansi('·', 'dim')} {f}")
+    print(ansi("\nvalues", "brand") + ansi("  (source: default unless shown)", "dim"))
+
+    def walk(node, path=""):
+        for k, val in node.items():
+            key = f"{path}{k}"
+            if isinstance(val, dict) and val and key not in ("keys", "theme"):
+                walk(val, key + ".")
+            else:
+                src = CFG_SOURCES.get(key) or next((v for p_, v in CFG_SOURCES.items()
+                                                    if p_.startswith(key + ".")), "")
+                print(f"  {key:<36} {json.dumps(val, ensure_ascii=False)}" + (f"  {ansi(src, 'info')}" if src else ""))
+    walk(CFG)
+    print(ansi("\nkeys", "brand"))
+    for a, _, where, label in list(ACTIONS) + [x[:4] for x in PLUGINS.actions]:
+        print(f"  {key_name(KEYS[a]):<6} {a:<24} {where:<10} {label}")
+    presets = list_presets()
+    print(ansi("\npresets", "brand") + f"  {', '.join(presets) or '(none)'}")
+    if PLUGINS.loaded:
+        print(ansi("plugins", "brand") + "  " + ", ".join(PLUGINS.loaded))
+    errs = CONFIG_ERRORS + PLUGINS.errors + site_binds()[1]
+    for e in errs:
+        print(ansi(f"⚠ {e}", "warn"))
+    sys.exit(1 if errs else 0)
+
+
 def main():
     sanitize_env()
+    if sys.argv[1:2] != ["config"]:
+        load_plugins()
     if ENV_NOTE:
-        print(f"htd-runai: {ENV_NOTE}", file=sys.stderr)
-    commands = {"status", "ls", "doctor", "submit", "watch", "save", "shell"}
+        print(f"runai-tui: {ENV_NOTE}", file=sys.stderr)
+    commands = {"status", "ls", "doctor", "submit", "watch", "save", "shell", "config"}
     if len(sys.argv) > 1 and sys.argv[1] in commands:
-        p = argparse.ArgumentParser(prog="htd-runai", description=__doc__.split("\n")[0])
+        p = argparse.ArgumentParser(prog="runai-tui", description=__doc__.split("\n")[0])
         sub = p.add_subparsers(dest="cmd", required=True)
         s = sub.add_parser("status", help="identity, quota bars, your workloads")
         s.add_argument("-p", "--project")
@@ -2985,17 +4067,19 @@ def main():
         s = sub.add_parser("shell", help="shell into a workload")
         s.add_argument("name")
         s.add_argument("-p", "--project")
+        s = sub.add_parser("config", help="the configuration in use, and where each value comes from")
+        s.add_argument("--defaults", action="store_true", help="print the built-in defaults as YAML")
         args = p.parse_args()
         {"status": cli_status, "ls": cli_ls, "doctor": cli_doctor, "submit": cli_submit, "watch": cli_watch,
-         "save": cli_save, "shell": cli_shell}[args.cmd](args)
+         "save": cli_save, "shell": cli_shell, "config": cli_config}[args.cmd](args)
         return
-    p = argparse.ArgumentParser(prog="htd-runai", usage="%(prog)s [-p PROJECT] | {status,ls,doctor,submit,watch,save,shell} ...",
+    p = argparse.ArgumentParser(prog="runai-tui", usage="%(prog)s [-p PROJECT] | {status,ls,doctor,submit,watch,save,shell,config} ...",
                                 description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-p", "--project", help="start in this project")
     p.add_argument("--setup", action="store_true", help="start on the Setup tab")
     args = p.parse_args()
     if not sys.stdout.isatty():
-        sys.exit("htd-runai: the TUI needs a terminal (try `htd-runai status`)")
+        sys.exit("runai-tui: the TUI needs a terminal (try `runai-tui status`)")
     sess, st = Session(), State()
     poller = Poller(sess, st)
     poller.start()
