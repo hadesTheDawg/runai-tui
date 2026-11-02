@@ -72,6 +72,19 @@ If your Run:ai version serves these lists from other paths, change them under
 `api:`. A list that returns an error is treated as empty, except
 environments.
 
+```yaml
+api:                                   # the defaults (Run:ai 2.2x / 3.0)
+  environments: /api/v1/asset/environment
+  computes: /api/v1/asset/compute
+  datasources: /api/v1/asset/datasource          # older: /api/v1/asset/datasources
+  templates: /api/v1/workload-templates          # older: /api/v1/asset/workload-template
+  departments: /api/v1/org-unit/departments
+  applications: /api/v1/ai-applications
+```
+
+Templates in either format are read. `M` in the form creates assets and
+templates under these paths (`<datasources>/host-path`, `<templates>/trainings`, ...).
+
 ## Bind mounts
 
 These are host paths mounted into the container as `hostPath` volumes. They
@@ -147,25 +160,81 @@ poll:
 
 Workloads are fetched a page at a time, so the list isn't cut off at 500.
 
-## Keys and colours
+## Keys
 
 ```yaml
 keys:
   delete: X        # action: key (one character, "ctrl-x" or "space")
   shell: s
-theme:
-  brand: 39        # fg
-  head: white on 22   # fg on bg; names (black, red, green, yellow, blue, magenta, cyan,
-                      # white, default) or 0-255
 ```
 
 The actions are listed by `runai-tui config` and in `?` help, which always
 shows the keys in use. A key bound to two actions that are active at the
 same time, or taken from movement keys (`1-4 j k Tab Enter Esc Space`, plus
-`h l q` in the form), is reported and that binding keeps its default. Theme
-styles: `head ok warn info err sel brand mag dim tab`. Colours the terminal
-can't show (256-colour numbers on an 8-colour terminal) keep the built-in
-ones.
+`h l q` in the form), is reported and that binding keeps its default.
+
+## Colour themes
+
+`T` in the TUI (or Setup → *Colour theme*, or `runai-tui theme`) picks a
+theme. The picker previews each one as you move through the list. Built in:
+
+| Name | |
+|---|---|
+| `default` | the terminal's own colours (no background) |
+| `dracula` | Dracula |
+| `one-dark-pro` | One Dark Pro |
+| `monokai` | Monokai |
+| `solarized-dark` | Solarized Dark |
+
+The theme in use is, first to last: `$RUNAI_TUI__THEME__NAME`, the user's
+choice in `~/.config/runai-tui/current-theme` (written by the picker), then
+`theme.name` in the config files (so a site can set a default), then
+`default`.
+
+**Theme files** are YAML in `/etc/runai-tui/themes/` (the site's) and
+`~/.config/runai-tui/themes/` (yours; same name wins). The file name is the
+theme's name:
+
+```yaml
+# ~/.config/runai-tui/themes/nord.yaml
+name: Nord
+base: "#d8dee9 on #2e3440"     # normal text and the background
+head: "#d8dee9 on #3b4252"     # header bar
+tab: "#d8dee9 on #434c5e"      # tab bar
+sel: "#2e3440 on #88c0d0"      # selected row, active tab
+ok: "#a3be8c"
+warn: "#ebcb8b"
+info: "#88c0d0"
+err: "#bf616a"
+brand: "#d08770"               # accents, box borders
+mag: "#b48ead"
+dim: "#4c566a"
+```
+
+Each style is `fg` or `fg on bg`. A colour is a name (`black red green
+yellow blue magenta cyan white default`), `0-255`, or `#rrggbb`. Hex colours
+are mapped to the nearest of the 256 terminal colours, so they look close to
+the original but not identical. Styles left out keep the default theme's
+colours, and colours the terminal can't show (on an 8-colour terminal)
+do too.
+
+**Importing a VS Code theme**: `i` in the picker, or
+`runai-tui theme --import FILE`, reads a VS Code colour theme `.json` (comments
+and trailing commas are fine) and writes it as a theme file in
+`~/.config/runai-tui/themes/`. It uses the editor background and foreground,
+the status bar, tab bar and list selection colours, the terminal ANSI colours,
+and the comment and number token colours. Themes that only `include` another
+file need that file imported instead.
+
+`theme.<style>` in the config overrides single styles on top of whichever
+theme is in use:
+
+```yaml
+theme:
+  name: dracula    # the site's or your default theme
+  brand: 39        # fg
+  head: white on 22
+```
 
 ## Hooks
 

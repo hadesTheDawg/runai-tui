@@ -94,8 +94,10 @@ DEFAULTS = {
         "workloads": "/api/v1/workloads",
         "environments": "/api/v1/asset/environment",
         "computes": "/api/v1/asset/compute",
-        "datasources": "/api/v1/asset/datasources",
-        "templates": "/api/v1/asset/workload-template",
+        "datasources": "/api/v1/asset/datasource",      # create: <this>/host-path, /pvc
+        "templates": "/api/v1/workload-templates",       # create: <this>/trainings, /workspaces
+        "departments": "/api/v1/org-unit/departments",
+        "applications": "/api/v1/ai-applications",
     },
     "poll": {
         "idle": 6, "busy": 2, "logged_out": 15,      # seconds between refreshes
@@ -120,7 +122,7 @@ DEFAULTS = {
     },
     "plugins": {"enabled": True, "dirs": ["/etc/runai-tui/plugins", "~/.config/runai-tui/plugins"]},
     "keys": {},              # action -> key, e.g. {delete: X, shell: s}; see `?` in the TUI for actions
-    "theme": {},             # style -> "fg" or "fg on bg" (names or 0-255), e.g. {brand: 39, head: "white on 22"}
+    "theme": {},             # name: a theme (T in the TUI); style -> "fg" or "fg on bg" (names, 0-255, #rrggbb)
 }
 CONFIG_FILES = ["/etc/runai-tui/config.yaml", "~/.config/runai-tui/config.yaml"]
 PRESET_DIRS = ["/etc/runai-tui/presets", "~/.config/runai-tui/presets"]     # the last one is writable
@@ -201,7 +203,10 @@ ACTIONS = [
     ("help", "?", "global", "this help"),
     ("quit", "q", "global", "quit"),
     ("login", "i", "global", "log in"),
+    ("theme", "T", "global", "colour theme (preview, switch, import)"),
+    ("pvcs", "v", "global", "PVCs in the project, with sizes"),
     ("shell", "s", "workload", "shell into it (also Enter on Workloads)"),
+    ("attach", "t", "workload", "attach to its main process (the program's own terminal)"),
     ("logs", "l", "workload", "logs"),
     ("follow_logs", "L", "workload", "follow logs (Ctrl-C returns)"),
     ("describe", "d", "workload", "describe (events)"),
@@ -216,14 +221,20 @@ ACTIONS = [
     ("forget_done", "D", "activity", "forget finished entries"),
     ("fix_all", "A", "setup", "fix everything safe"),
     ("logout", "o", "setup", "log out"),
+    ("app_describe", "d", "apps", "describe the application (also Enter)"),
+    ("app_delete", "x", "apps", "delete the application"),
+    ("app_submit", "S", "apps", "submit an AI application (Helm chart)"),
     ("form_submit", "S", "form", "submit"),
     ("form_write", "W", "form", "write YAML (or a script for workspaces)"),
     ("form_edit", "E", "form", "edit in $EDITOR, then submit"),
     ("form_presets", "P", "form", "presets: load / save / delete"),
+    ("form_go", "G", "form", "submit, then attach or shell in once it runs"),
+    ("form_runai", "M", "form", "save to Run:ai: environment, compute resource, data source or template"),
 ]
 # keys a binding may not take: tab numbers, movement, Enter/Tab/Esc/space
-RESERVED = {"main": set("1234jk\t\n\r\x1b "), "form": set("jkhl\t\n\r\x1b q")}
-SCOPE_TABS = {"global": {0, 1, 2, 3}, "workload": {1, 2}, "workloads": {1}, "activity": {2}, "setup": {3}}
+RESERVED = {"main": set("123456jk\t\n\r\x1b "), "form": set("jkhl\t\n\r\x1b q")}
+SCOPE_TABS = {"global": {0, 1, 2, 3, 4, 5}, "workload": {1, 2}, "workloads": {1}, "activity": {2}, "apps": {4},
+              "setup": {5}}                     # tab numbers: Overview Workloads Activity Quota Apps Setup
 
 
 def parse_key(spec):
@@ -666,6 +677,9 @@ class State:
         self.error = ""
         self.projects, self.workloads = [], []
         self.envs, self.computes, self.datasources, self.templates = [], [], [], []
+        self.want_quota = self.want_apps = False   # set while those tabs are shown: fetched only then
+        self.departments, self.dept_error = None, ""
+        self.apps, self.apps_error = None, ""
         self.scope = ""                  # project the TUI shows ("" = all): polled fast with poll.scope project
         self.pods = {}                   # workload id -> (time, [pods] | error str)
         self.focus_id = None
@@ -782,6 +796,19 @@ class Poller(threading.Thread):
             if time.time() - self.assets_at > CFG["poll"]["assets"]:
                 assets = {k: fetch_assets(sess, k) for k in ("environments", "computes", "datasources", "templates")}
                 self.assets_at = time.time()
+            deps = apps = None
+            if st.want_quota:
+                try:
+                    deps = (sess.api(f"{CFG['api']['departments']}?limit=500&verbosity=verbose") or {}) \
+                        .get("departments") or []
+                except ApiError as e:
+                    deps = str(e)
+            if st.want_apps:
+                try:
+                    apps = (sess.api(f"{CFG['api']['applications']}?limit=500&verbosity=full") or {}) \
+                        .get("applications") or []
+                except ApiError as e:
+                    apps = str(e)
             pods = None
             fid = st.focus_id
             if fid:
@@ -802,6 +829,11 @@ class Poller(threading.Thread):
                     st.templates = sorted(assets["templates"], key=by_name)
                 if fid:
                     st.pods[fid] = (now, pods)
+                if deps is not None:
+                    st.departments, st.dept_error = (None, deps) if isinstance(deps, str) else (deps, "")
+                if apps is not None:
+                    st.apps, st.apps_error = (None, apps) if isinstance(apps, str) else (
+                        sorted(apps, key=lambda a: app_info(a)["name"]), "")
                 for w in wls:
                     h = st.history.setdefault(w["id"], [])
                     if not h or h[-1][0] != w.get("phase"):
@@ -1149,6 +1181,8 @@ def datasource_mount(d, workspace=False):
     """A data source asset -> (volume, volumeMount) for a manifest, or CLI flags for a workspace.
     Raises ValueError for kinds the form cannot mount."""
     kind, s, name = ds_kind(d), d.get("spec") or {}, asset_name(d)
+    if len(s) == 1 and isinstance(next(iter(s.values())), dict):     # the list nests it: {hostPath: {...}}
+        s = next(iter(s.values()))
     vol = "ds-" + re.sub(r"[^a-z0-9-]", "-", name.lower())[:58].strip("-")
     ro = bool(s.get("readOnly"))
     if kind == "pvc":
@@ -1228,6 +1262,71 @@ def format_binds(binds):
                      for b in binds)
 
 
+PVC_RE = re.compile(r"^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$")
+ACCESS_MODES = {"ReadWriteOnce": "RWO", "ReadOnlyMany": "ROX", "ReadWriteMany": "RWX", "ReadWriteOncePod": "RWOP"}
+
+
+def parse_pvcs(text):
+    """'claim:/path[:ro|rw], ...' -> ([{host: claim, path, ro}], [problems]). Read-write unless :ro."""
+    out, errs = [], []
+    for item in [x.strip() for x in (text or "").split(",") if x.strip()]:
+        parts = item.split(":")
+        mode = "rw"
+        if parts[-1] in ("ro", "rw"):
+            mode = parts.pop()
+        if len(parts) != 2 or not PVC_RE.match(parts[0]) or not parts[1].startswith("/"):
+            errs.append(f"PVC '{item}': use claim-name:/mount/path[:ro]")
+            continue
+        out.append({"host": parts[0], "path": parts[1], "ro": mode == "ro", "type": ""})
+    return out, errs
+
+
+def format_pvcs(items):
+    return ", ".join(f"{p['host']}:{p['path']}" + (":ro" if p["ro"] else "") for p in items)
+
+
+def project_namespace(state, project):
+    p = state.project(project) or {}
+    return (p.get("status") or {}).get("namespace") or f"runai-{project}"
+
+
+def list_pvcs(project, namespace):
+    """-> ([{name, managed, size, phase, sc, modes}], note). Names from `runai pvc list`; size, status,
+    access modes and storage class from kubectl, if you may read PVCs in the namespace."""
+    out, notes = {}, []
+    rc, so, se = cmd([RUNAI, "pvc", "list", "-p", project, "--json"], timeout=60)
+    if rc == 0:
+        try:
+            for x in (json.loads(so or "{}") or {}).get("pvcs") or []:
+                if x.get("name"):
+                    out[x["name"]] = {"name": x["name"], "managed": x.get("managed")}
+        except (ValueError, AttributeError):
+            notes.append("runai pvc list: unreadable output")
+    else:
+        notes.append("runai pvc list: " + first_error(se, so))
+    rc, ko, ke = cmd([KUBECTL, "get", "pvc", "-n", namespace, "-o", "json"], timeout=30)
+    if rc == 0:
+        try:
+            for x in json.loads(ko).get("items") or []:
+                n, sp, st = x["metadata"]["name"], x.get("spec") or {}, x.get("status") or {}
+                d = out.setdefault(n, {"name": n, "managed": None})
+                d.update(size=(st.get("capacity") or {}).get("storage")
+                         or ((sp.get("resources") or {}).get("requests") or {}).get("storage") or "",
+                         phase=st.get("phase") or "", sc=sp.get("storageClassName") or "",
+                         modes=",".join(ACCESS_MODES.get(m, m) for m in sp.get("accessModes") or []))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            notes.append("kubectl get pvc: unreadable output")
+    else:
+        notes.append(f"no sizes: kubectl cannot list PVCs in {namespace} ({first_error(ke, ko)})")
+    return sorted(out.values(), key=lambda d: d["name"]), "; ".join(notes)
+
+
+def pvc_line(d):
+    managed = {True: "Run:ai", False: "", None: ""}[d.get("managed")]
+    return (f"{d['name']:<28} {d.get('size') or '?':>7}  {d.get('phase') or '':<8} {d.get('modes') or '':<8} "
+            f"{d.get('sc') or '':<14} {managed}").rstrip()
+
+
 def form_binds(v):
     """The form's bind mounts (ticked site ones, then extra ones) -> ([bind], [warnings])."""
     known, errs = site_binds()
@@ -1239,8 +1338,22 @@ def form_binds(v):
     return binds + extra, errs + bad
 
 
+def join_command(command, args):
+    """An environment's or template's command + args -> the form's sh -c text (unwraps sh -c '...')."""
+    if command in ("sh", "/bin/sh", "bash", "/bin/bash") and str(args or "").startswith("-c "):
+        try:
+            rest = shlex.split(args)
+            if len(rest) == 2:
+                return rest[1]
+        except ValueError:
+            pass
+    return " ".join(x for x in (command, args) if x)
+
+
 def template_values(t, state):
-    """A workload template asset -> (form values, notes). Assets are referenced by id."""
+    """A workload template -> (form values, notes). Assets are referenced by id."""
+    if "workloadType" in (t.get("meta") or {}) or "assets" in t:
+        return template_values_v2(t, state)
     s = t.get("spec") or {}
     a = s.get("assets") or {}
     out, notes = {}, []
@@ -1263,7 +1376,7 @@ def template_values(t, state):
         if None in ds:
             notes.append(f"{ds.count(None)} data source(s) not visible to you")
     se = s.get("specificEnv") or {}
-    command = " ".join(x for x in (se.get("command"), se.get("args")) if x)
+    command = join_command(se.get("command"), se.get("args"))
     if command:
         out["command"] = command
     envs = [f"{e['name']}={e.get('value', '')}" for e in se.get("environmentVariables") or []
@@ -1271,6 +1384,85 @@ def template_values(t, state):
     if envs:
         out["env_vars"] = ",".join(envs)
     return out, notes
+
+
+def _by_id(items, ref):
+    ref = ref.get("id") if isinstance(ref, dict) else ref
+    return next((x for x in items if str((x.get("meta") or {}).get("id")) == str(ref)), None) if ref else None
+
+
+def template_values_v2(t, state):
+    """A template from /api/v1/workload-templates (spec inline, assets by id) -> (form values, notes)."""
+    s, a, m = t.get("spec") or {}, t.get("assets") or {}, t.get("meta") or {}
+    out, notes = {}, []
+    wt = m.get("workloadType") or ""
+    if wt in ("Workspace", "Training"):
+        out["kind"] = wt.lower()
+    elif wt:
+        notes.append(f"a {wt} template: filled in as a batch job")
+    env = _by_id(state.envs, a.get("environment"))
+    if env:
+        out["env"] = asset_name(env)
+    elif a.get("environment"):
+        notes.append("its environment is not visible to you")
+    if s.get("image"):
+        out["image"] = s["image"]
+        if not env:
+            out["env"] = "(custom image)"
+    comp = _by_id(state.computes, a.get("compute"))
+    if comp:
+        out["compute"] = asset_name(comp)
+    elif a.get("compute"):
+        notes.append("its compute resource is not visible to you")
+    elif s.get("compute"):
+        vals, note = compute_values({"spec": s["compute"]})
+        out.update(vals, compute="(custom)")
+        if note:
+            notes.append(note)
+    if a.get("datasources"):
+        ds = [_by_id(state.datasources, r) for r in a["datasources"]]
+        out["datasources"] = [asset_name(d) for d in ds if d]
+        if None in ds:
+            notes.append(f"{ds.count(None)} data source(s) not visible to you")
+    command = join_command(s.get("command"), s.get("args"))
+    if command and not (s.get("command") == "sleep" and s.get("args") == "infinity"):
+        out["command"] = command
+    envs = [f"{e['name']}={e.get('value', '')}" for e in s.get("environmentVariables") or []
+            if e.get("name") and "value" in e]
+    if envs:
+        out["env_vars"] = ",".join(envs)
+    hp, hm = SITE["home"].get("host_path") or "", SITE["home"].get("mount_path") or "/home"
+    st = s.get("storage") or {}
+    binds = [{"host": x.get("path"), "path": x.get("mountPath") or x.get("path"), "ro": bool(x.get("readOnly")),
+              "type": ""} for x in st.get("hostPath") or []
+             if x.get("path") and not (x.get("path") == hp and x.get("mountPath") == hm)]
+    if binds:
+        out["extra_binds"] = format_binds(binds)
+    pvcs = [{"host": x["claimName"], "path": x.get("path") or f"/data/{x['claimName']}",
+             "ro": bool(x.get("readOnly")), "type": ""} for x in st.get("pvc") or [] if x.get("claimName")]
+    if pvcs:
+        out["pvcs"] = format_pvcs(pvcs)
+    for e in st.get("emptyDirVolume") or []:
+        if e.get("path") == "/scratch" and e.get("sizeLimit"):
+            out["scratch"] = str(e["sizeLimit"])
+    if (s.get("security") or {}).get("uidGidSource") == "fromIdpToken":
+        out["run_as_me"] = True
+    if s.get("nodePools"):
+        out["pool"] = s["nodePools"][0]
+    if s.get("priorityClass") in PRIORITIES:
+        out["priority"] = s["priorityClass"]
+    if s.get("preemptibility") in ("preemptible", "non-preemptible"):
+        out["preempt"] = s["preemptibility"]
+    if s.get("completions"):
+        out["completions"] = str(s["completions"])
+    if s.get("autoDeletionTimeAfterCompletionSeconds"):
+        out["ttl"] = str(s["autoDeletionTimeAfterCompletionSeconds"])
+    return out, notes
+
+
+def api_mem(mem):
+    """Form memory -> what the Run:ai CLI and API take (M/G): binary units in whole MB, so 1Gi stays 1Gi."""
+    return mem if not mem.endswith("i") else f"{-(-int(mem_bytes(mem)) // 10 ** 6)}M"
 
 
 def build_workload(v, sess, state):
@@ -1340,6 +1532,8 @@ def build_workload(v, sess, state):
     pull = v.get("pull_secret") or "(none)"
     binds, bind_warn = form_binds(v)
     warn += bind_warn
+    pvcs, pvc_warn = parse_pvcs(v.get("pvcs"))
+    warn += pvc_warn
 
     if kind == "workspace":                      # Run:ai CLI, keeps the environment's tools/URLs
         argv = [RUNAI, "workspace", "submit", name, "-p", proj]
@@ -1349,9 +1543,8 @@ def build_workload(v, sess, state):
             argv += ["-i", image]
         if cpu:
             argv += ["--cpu-core-request", cpu]
-        if mem:          # the CLI takes M/G: binary units in whole MB, so 1Gi stays 1Gi (1074M)
-            argv += ["--cpu-memory-request",
-                     mem if not mem.endswith("i") else f"{-(-int(mem_bytes(mem)) // 10 ** 6)}M"]
+        if mem:
+            argv += ["--cpu-memory-request", api_mem(mem)]
         if gpu == "whole":
             argv += ["-g", str(int(g or 1))]
         elif gpu == "fraction":
@@ -1369,6 +1562,10 @@ def build_workload(v, sess, state):
                 warn.append(str(e))
         for b in binds:
             argv += ["--host-path", f"path={b['host']},mount={b['path']}" + ("" if b["ro"] else ",readwrite")]
+        for c in pvcs:
+            argv += ["--existing-pvc", f"claimname={c['host']},path={c['path']}"]
+        if any(c["ro"] for c in pvcs):
+            warn.append("PVCs: read-only is not available for CLI workspaces (mounted read-write)")
         if pull != "(none)":
             warn.append("pull secret: not available for CLI workspaces (use an environment with credentials)")
         for e in env_vars:
@@ -1421,6 +1618,10 @@ def build_workload(v, sess, state):
             mounts.append(mnt)
         except ValueError as e:
             warn.append(str(e))
+    for i, c in enumerate(pvcs):
+        vols.append({"name": f"pvc-{i}", "persistentVolumeClaim": {"claimName": c["host"],
+                                                                   **({"readOnly": True} if c["ro"] else {})}})
+        mounts.append({"name": f"pvc-{i}", "mountPath": c["path"], **({"readOnly": True} if c["ro"] else {})})
     for i, b in enumerate(binds):
         vol = f"bind-{i}"
         vols.append({"name": vol, "hostPath": {"path": b["host"], **({"type": b["type"]} if b["type"] else {})}})
@@ -1493,6 +1694,182 @@ def build_workload(v, sess, state):
     return man, None, warn
 
 
+# --- saving to Run:ai: assets and workload templates (REST API; the CLI cannot create them) ------
+def asset_meta(name, project, desc):
+    pid = project.get("id")
+    return {"name": name, "scope": "project", "projectId": int(pid) if str(pid).isdigit() else pid,
+            "clusterId": project.get("clusterId"), "description": desc}
+
+
+def sh_args(command):
+    """The form's sh -c text -> (command, args) for an environment or template."""
+    return ("sh", "-c " + shlex.quote(command)) if command else (None, None)
+
+
+def form_compute(v):
+    """The form's CPU, memory, GPU and /dev/shm -> a Run:ai compute spec."""
+    c = {}
+    if v["cpu"].strip():
+        c["cpuCoreRequest"] = float(v["cpu"])
+    if v["memory"].strip():
+        c["cpuMemoryRequest"] = api_mem(v["memory"].strip())
+    c["gpuRequestType"] = "portion"
+    if v["gpu"] == "whole":
+        c.update(gpuDevicesRequest=int(float(v["gpu_amount"] or 1)), gpuPortionRequest=1.0)
+    elif v["gpu"] == "fraction":
+        c.update(gpuDevicesRequest=1, gpuPortionRequest=float(v["gpu_amount"]))
+    else:
+        c["gpuDevicesRequest"] = 0
+    if v["shm"].strip():
+        c["largeShmRequest"] = True
+    return c
+
+
+def environment_body(name, v, project, desc):
+    spec = {"image": v["image"].strip(), "imagePullPolicy": "IfNotPresent",
+            "uidGidSource": "fromIdpToken" if v["run_as_me"] else "fromTheImage"}
+    command, args = sh_args(v["command"].strip())
+    if command:
+        spec.update(command=command, args=args)
+    meta = dict(asset_meta(name, project, desc), workloadSupportedTypes={
+        "workspace": True, "training": True, "inference": False, "distributed": False})
+    return {"meta": meta, "spec": spec}
+
+
+def template_body(name, v, state, desc):
+    """The form -> (templates sub-path, request body, notes). Everything is stored in the template
+    itself (a template that links an environment asset may not set its command, env or user)."""
+    tkind = {"training": "trainings", "interactive": "trainings", "workspace": "workspaces"}.get(v["kind"])
+    if not tkind:
+        raise ValueError("services (Deployments) have no Run:ai template type: change Kind, or save a preset (P)")
+    p = state.project(v["project"]) or {}
+    notes, spec = [], {"image": v["image"].strip()}
+    command, args = sh_args(v["command"].strip())
+    if command:
+        spec.update(command=command, args=args)
+    elif v["kind"] == "interactive":
+        spec.update(command="sleep", args="infinity")
+    envs = [x.split("=", 1) for x in v["env_vars"].split(",") if "=" in x]
+    if envs:
+        spec["environmentVariables"] = [{"name": k.strip(), "value": val} for k, val in envs]
+    spec["compute"] = form_compute(v)
+    hp, hm = SITE["home"].get("host_path") or "", SITE["home"].get("mount_path") or "/home"
+    binds, _ = form_binds(v)
+    host = ([{"name": "home", "path": hp, "mountPath": hm, "readOnly": False}] if v["run_as_me"] and hp else [])
+    host += [{"name": f"bind-{i}", "path": b["host"], "mountPath": b["path"], "readOnly": b["ro"]}
+             for i, b in enumerate(binds)]
+    storage = {}
+    if host:
+        storage["hostPath"] = host
+    pvcs = parse_pvcs(v.get("pvcs"))[0]
+    if pvcs:
+        storage["pvc"] = [{"name": f"pvc-{i}", "claimName": c["host"], "path": c["path"], "existingPvc": True,
+                           "readOnly": c["ro"]} for i, c in enumerate(pvcs)]
+    if v["scratch"].strip():
+        storage["emptyDirVolume"] = [{"name": "scratch", "path": "/scratch", "sizeLimit": v["scratch"].strip()}]
+    if storage:
+        spec["storage"] = storage
+    if v["run_as_me"]:
+        spec["security"] = {"uidGidSource": "fromIdpToken"}
+    if v["pool"] != "any":
+        spec["nodePools"] = [v["pool"]]
+    if v["priority"] != "default":
+        spec["priorityClass"] = v["priority"]
+    if v["preempt"] != "default":
+        spec["preemptibility"] = v["preempt"]
+    if tkind == "trainings":
+        n = int(v["completions"] or 1) if str(v["completions"] or "1").isdigit() else 1
+        if n > 1:
+            spec.update(completions=n, parallelism=n)
+        if v["ttl"].strip().isdigit():
+            spec["autoDeletionTimeAfterCompletionSeconds"] = int(v["ttl"])
+    if (v.get("pull_secret") or "(none)") != "(none)":
+        notes.append("the image pull secret is not part of templates")
+    ds_by = {asset_name(d): d for d in state.datasources}
+    ids = [str((ds_by[n].get("meta") or {}).get("id")) for n in v.get("datasources") or [] if n in ds_by]
+    body = {"meta": {"name": name, "scopeType": "project", "scopeId": str(p.get("id")), "description": desc},
+            "spec": spec}
+    if ids:
+        body["assets"] = {"datasources": ids}
+    return tkind, body, notes
+
+
+# --- quota by department ----------------------------------------------------------------------
+def project_totals(p):
+    """GPU totals of a project over its node pools: alloc, quota, limit (None = no limit), pending, weight."""
+    qs = project_pools(p)
+    total = (p.get("totalResources") or {}).get("gpuQuota")
+    limits = [q["limit"] for q in qs if pool_visible(q)]      # pools without quota or use don't count
+    return {"alloc": sum(q["gpu"] for q in qs), "quota": total if total not in (None, -1) else sum(q["quota"] for q in qs),
+            "limit": None if not limits or any(x in (None, -1) for x in limits) else sum(limits),
+            "pending": max(0, sum(q["gpu_req"] for q in qs) - sum(q["gpu"] for q in qs)),
+            "nonpre": sum(q["gpu_np"] for q in qs), "weight": max([q["weight"] or 0 for q in qs] or [0])}
+
+
+def org_rows(projects, departments):
+    """-> [(dept name, dept totals, [(project, totals)])], departments in name order. Departments the
+    API did not return (no permission) are made up from their projects."""
+    by = {}
+    for p in projects:
+        by.setdefault((p.get("parent") or {}).get("name") or "-", []).append(p)
+    deps = {d.get("name"): d for d in departments or []}
+    out = []
+    for name in sorted(set(by) | set(deps)):
+        kids = [(p, project_totals(p)) for p in sorted(by.get(name, []), key=lambda p: p.get("name", ""))]
+        d = deps.get(name) or {}
+        alloc = ((d.get("status") or {}).get("quotaStatus") or {}).get("allocated") or {}
+        quota = (d.get("totalResources") or {}).get("gpuQuota")
+        tot = {"alloc": alloc.get("gpu") if alloc.get("gpu") is not None else sum(t["alloc"] for _, t in kids),
+               "quota": None if quota in (None, -1) else quota, "known": bool(d),
+               "projects_quota": sum(t["quota"] for _, t in kids)}
+        out.append((name, tot, kids))
+    return out
+
+
+# --- AI applications --------------------------------------------------------------------------
+def app_info(a):
+    """An AI application from the API -> {name, project, status, chart, created, workloads}."""
+    m = a.get("meta") if isinstance(a.get("meta"), dict) else {}
+    sp = a.get("spec") if isinstance(a.get("spec"), dict) else {}
+    st = a.get("status")
+
+    def first(*vals):
+        return next((x for x in vals if x not in (None, "", [], {})), "")
+    status = st if isinstance(st, str) else first(*(((st or {}).get(k)) for k in ("phase", "status", "state")))
+    wls = first((st or {}).get("workloads") if isinstance(st, dict) else None, a.get("workloads"), a.get("components"))
+    return {"name": first(a.get("name"), m.get("name")), "id": first(a.get("id"), m.get("id")),
+            "project": first(a.get("projectName"), m.get("projectName"), a.get("project"), sp.get("projectName")),
+            "status": str(first(status, a.get("phase"))), "chart": first(sp.get("chartUrl"), a.get("chartUrl"),
+                                                                         sp.get("chart"), a.get("chart")),
+            "created": str(first(a.get("createdAt"), m.get("createdAt")))[:19].replace("T", " "),
+            "workloads": len(wls) if isinstance(wls, list) else (wls or "")}
+
+
+_KUBECTL_DETACH = []
+
+
+def kubectl_can_detach():
+    """kubectl attach with --detach-keys (Ctrl-P Ctrl-Q leaves the program running); runai attach has none."""
+    if not _KUBECTL_DETACH:
+        rc, out, err = cmd([KUBECTL, "attach", "--help"], timeout=15)
+        _KUBECTL_DETACH.append(rc == 0 and "--detach-keys" in out + err)
+    return _KUBECTL_DETACH[0]
+
+
+def attach_words(w):
+    """-> the runai sub-command for attach (['workspace'], ['training', 'standard'], ...), or None:
+    then kubectl attach is used."""
+    t = w.get("type") or ""
+    if t == "Workspace":
+        return ["workspace"]
+    if t == "Training":
+        return ["training", "standard"]
+    fw = str(w.get("distributedFramework") or w.get("framework") or "").lower()
+    if t == "Distributed" and fw in ("pytorch", "mpi", "tf", "tensorflow", "xgboost", "jax"):
+        return ["training", {"tensorflow": "tf"}.get(fw, fw)]
+    return None
+
+
 def registry_host(state):
     return (SITE.get("registry") or "").rstrip("/")
 
@@ -1518,7 +1895,7 @@ def manifest_text(man, project):
 # --- form presets: ~/.config/runai-tui/presets/<name>.yaml (site ones in /etc/runai-tui/presets) ---------
 FORM_EMPTY = {"project": "", "template": "(none)", "kind": "training", "name": "", "env": "(custom image)",
               "image": "", "command": "", "compute": "(custom)", "gpu": "none", "gpu_amount": "0.5", "pool": "any",
-              "cpu": "", "memory": "", "run_as_me": True, "datasources": [], "binds": [], "extra_binds": "", "scratch": "", "shm": "",
+              "cpu": "", "memory": "", "run_as_me": True, "datasources": [], "pvcs": "", "binds": [], "extra_binds": "", "scratch": "", "shm": "",
               "env_vars": "", "pull_secret": "(none)", "completions": "1", "ttl": "", "priority": "default",
               "preempt": "default"}
 
@@ -1919,6 +2296,15 @@ def run_checks(sess, state, cb=None):
               detail + (f"; {len(errs)} problem(s): {errs[0]}" if errs else ""),
               help="`runai-tui config` shows every value and where it comes from. Problems:\n  "
                    + "\n  ".join(errs) if errs else "Files: " + ", ".join(CONFIG_FILES)))
+    # 13 theme
+    tname, tsrc = theme_choice()
+    themes = load_themes()
+    add(Check("theme", "Colour theme", "ok" if tname in themes else "warn",
+              f"{(themes.get(tname) or {}).get('name') or tname}" + (f" (from {tsrc})" if tsrc else "")
+              + f"; {len(themes)} themes", fix=("choose a colour theme (also T anywhere)", "theme"),
+              help="Moving through the list previews each theme; Enter keeps it. i imports a VS Code\n"
+                   "colour theme (the .json in an extension's themes/ folder) or a runai-tui .yaml theme\n"
+                   f"into {THEME_DIRS[-1]}/."))
     for name, fn in PLUGINS.checks:
         try:
             got = fn(sess, state)
@@ -1955,13 +2341,17 @@ def help_text():
         return [f"   {key_name(KEYS[a]):<6} {label}" for a, _, w, label in acts if w == where]
 
     out = [" runai-tui: Run:ai for researchers", "",
-           " Everywhere", "   1-4    Overview · Workloads · Activity · Setup     Tab  next view"] + section("global")
+           " Everywhere", "   1-6    Overview · Workloads · Activity · Quota · Apps · Setup     Tab  next view"]
+    out += section("global")
     out += ["", " Workloads and Activity (the selected workload)",
             "   ↑/↓ j/k move   PgUp/PgDn scroll details   Enter shell (Workloads) / go to (Activity)"]
     out += section("workload")
     out += ["", " Workloads"] + section("workloads")
     out += ["", " Activity       progress of everything you submitted or have in flight"] + section("activity")
     out += ["", " Setup          the one-time checklist", "   Enter  fix the selected item"] + section("setup")
+    out += ["", " Quota          GPUs by department and project (allocated, guaranteed, over quota, limit)",
+            "   Enter  show that project"]
+    out += ["", " Apps           AI applications (Helm charts run as a group of workloads)"] + section("apps")
     out += ["", " Form (n)", "   ↑/↓    field     Enter / ←→  edit or change     Esc  cancel"] + section("form")
     out += ["", " Marks  ★ yours   ● running   ◐ pending/starting   ✔ completed   ✖ failed", "",
             " Submitting: one object per file -> `runai workload submit -f`; files with several",
@@ -1972,38 +2362,246 @@ def help_text():
     return "\n".join(out)
 
 
-TABS = ["Overview", "Workloads", "Activity", "Setup"]
+TABS = ["Overview", "Workloads", "Activity", "Quota", "Apps", "Setup"]
+T_QUOTA, T_APPS, T_SETUP = TABS.index("Quota"), TABS.index("Apps"), TABS.index("Setup")
 THEME_STYLES = ["head", "ok", "warn", "info", "err", "sel", "brand", "mag", "dim", "tab"]
+THEME_KEYS = ["base"] + THEME_STYLES      # base: normal text and the background behind everything
 COLOR_NAMES = {"default": -1, "black": 0, "red": 1, "green": 2, "yellow": 3, "blue": 4, "magenta": 5,
                "cyan": 6, "white": 7}
+THEME_DIRS = ["/etc/runai-tui/themes", "~/.config/runai-tui/themes"]     # the last one is writable
+THEME_CHOICE = "~/.config/runai-tui/current-theme"                       # written by the theme picker
+# Popular VS Code colour themes, as "fg" or "fg on bg" per style (hex is mapped to the 256-colour palette).
+BUILTIN_THEMES = {
+    "default": {"name": "Default (terminal colours)"},
+    "dracula": {"name": "Dracula", "base": "#f8f8f2 on #282a36", "head": "#f8f8f2 on #191a21",
+                "tab": "#f8f8f2 on #44475a", "sel": "#282a36 on #bd93f9", "ok": "#50fa7b", "warn": "#f1fa8c",
+                "info": "#8be9fd", "err": "#ff5555", "brand": "#ffb86c", "mag": "#ff79c6", "dim": "#6272a4"},
+    "one-dark-pro": {"name": "One Dark Pro", "base": "#abb2bf on #282c34", "head": "#abb2bf on #21252b",
+                     "tab": "#abb2bf on #3e4451", "sel": "#282c34 on #61afef", "ok": "#98c379", "warn": "#e5c07b",
+                     "info": "#56b6c2", "err": "#e06c75", "brand": "#d19a66", "mag": "#c678dd", "dim": "#5c6370"},
+    "monokai": {"name": "Monokai", "base": "#f8f8f2 on #272822", "head": "#f8f8f2 on #414339",
+                "tab": "#f8f8f2 on #1e1f1c", "sel": "#272822 on #66d9ef", "ok": "#a6e22e", "warn": "#e6db74",
+                "info": "#66d9ef", "err": "#f92672", "brand": "#fd971f", "mag": "#ae81ff", "dim": "#75715e"},
+    "solarized-dark": {"name": "Solarized Dark", "base": "#839496 on #002b36", "head": "#93a1a1 on #00212b",
+                       "tab": "#93a1a1 on #073642", "sel": "#002b36 on #268bd2", "ok": "#859900",
+                       "warn": "#b58900", "info": "#2aa198", "err": "#dc322f", "brand": "#cb4b16",
+                       "mag": "#d33682", "dim": "#586e75"},
+}
+HEX_RE = re.compile(r"^#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+
+
+def hex_rgb(h):
+    h = h.lstrip("#")
+    if len(h) in (3, 4):
+        h = "".join(c * 2 for c in h)
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def hex256(h):
+    """'#rrggbb' -> the nearest xterm-256 colour (the 6x6x6 cube or the grey ramp, never 0-15)."""
+    rgb = hex_rgb(h)
+    lv = [0, 95, 135, 175, 215, 255]
+    ci = [min(range(6), key=lambda i: abs(lv[i] - v)) for v in rgb]
+    gi = max(0, min(23, round((sum(rgb) / 3 - 8) / 10)))
+
+    def dist(c):
+        return sum((a - b) ** 2 for a, b in zip(c, rgb))
+    if dist([lv[i] for i in ci]) <= dist([8 + 10 * gi] * 3):
+        return 16 + 36 * ci[0] + 6 * ci[1] + ci[2]
+    return 232 + gi
 
 
 def parse_color(spec):
-    """'green', '208', 'white on 22' -> (fg, bg or None)."""
+    """'green', '208', '#ff79c6', 'white on 22' -> (fg, bg or None)."""
     def one(x):
         x = str(x).strip().lower()
         if x in COLOR_NAMES:
             return COLOR_NAMES[x]
+        if HEX_RE.match(x):
+            return hex256(x)
         if x.lstrip("-").isdigit() and -1 <= int(x) <= 255:
             return int(x)
-        raise ValueError(f"'{x}' is not a colour (a name or 0-255)")
+        raise ValueError(f"'{x}' is not a colour (a name, 0-255 or #rrggbb)")
     fg, _, bg = str(spec).partition(" on ")
     return one(fg), (one(bg) if bg else None)
 
 
-def theme():
-    """theme: from the config -> {style: (fg, bg or None)}; bad entries are reported in Setup."""
-    out = {}
-    for style, spec in (CFG.get("theme") or {}).items():
+def load_themes():
+    """-> {name: {"name": title, style: spec, ..., "_src": where}}: built-ins, then theme files
+    (/etc/runai-tui/themes, ~/.config/runai-tui/themes; *.yaml, one of yours wins)."""
+    out = {k: dict(v, _src="built-in") for k, v in BUILTIN_THEMES.items()}
+    for d in THEME_DIRS:
+        d = os.path.expanduser(d)
+        for path in sorted(glob.glob(os.path.join(d, "*.yaml")) + glob.glob(os.path.join(d, "*.yml"))):
+            name = os.path.splitext(os.path.basename(path))[0]
+            try:
+                with open(path) as f:
+                    data = yaml.safe_load(f) or {}
+                if not isinstance(data, dict):
+                    raise ValueError("not a mapping")
+                out[name] = dict({str(k): v for k, v in data.items()}, _src=path)
+            except (OSError, ValueError, yaml.YAMLError) as e:
+                msg = f"{path}: {str(e).splitlines()[0]}"
+                if msg not in CONFIG_ERRORS:
+                    CONFIG_ERRORS.append(msg)
+    return out
+
+
+def theme_choice():
+    """-> (theme name, where the choice comes from). An env override wins, then the picker's choice
+    (~/.config/runai-tui/current-theme), then theme.name in the config files."""
+    src = CFG_SOURCES.get("theme.name", "")
+    name = str((CFG.get("theme") or {}).get("name") or "")
+    if not src.startswith("$"):
         try:
-            if style not in THEME_STYLES:
-                raise ValueError(f"no such style (styles: {', '.join(THEME_STYLES)})")
+            with open(os.path.expanduser(THEME_CHOICE)) as f:
+                saved = f.read().strip()
+            if saved:
+                return saved, THEME_CHOICE
+        except OSError:
+            pass
+    return (name, src) if name else ("default", "")
+
+
+def save_theme_choice(name):
+    path = os.path.expanduser(THEME_CHOICE)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(name + "\n")
+
+
+def theme(name=None):
+    """-> {style: (fg, bg or None)}: the chosen theme, then the theme.<style> overrides in the config.
+    Bad entries are reported in Setup."""
+    themes = load_themes()
+    name = name or theme_choice()[0]
+    if name not in themes:
+        msg = f"theme '{name}': no such theme (themes: {', '.join(themes)})"
+        if msg not in CONFIG_ERRORS:
+            CONFIG_ERRORS.append(msg)
+        name = "default"
+    specs = [(k, v, f"theme {name}") for k, v in themes[name].items() if k not in ("name", "_src")]
+    specs += [(k, v, "theme") for k, v in (CFG.get("theme") or {}).items() if k != "name"]
+    out = {}
+    for style, spec, where in specs:
+        try:
+            if style not in THEME_KEYS:
+                raise ValueError(f"no such style (styles: {', '.join(THEME_KEYS)})")
             out[style] = parse_color(spec)
         except ValueError as e:
-            msg = f"theme.{style}: {e}"
+            msg = f"{where}.{style}: {e}" if where == "theme" else f"{where}: {style}: {e}"
             if msg not in CONFIG_ERRORS:
                 CONFIG_ERRORS.append(msg)
     return out
+
+
+def strip_jsonc(text):
+    """VS Code theme files are JSON with comments and trailing commas."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c)
+            i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def vscode_theme(data):
+    """A VS Code colour theme (the JSON in an extension's themes/ folder) -> our styles."""
+    colors = data.get("colors") or {}
+    tokens = {}
+    for t in data.get("tokenColors") or []:
+        fg = (t.get("settings") or {}).get("foreground") if isinstance(t, dict) else None
+        scope = t.get("scope") if isinstance(t, dict) else None
+        for sc in scope if isinstance(scope, list) else str(scope or "").split(","):
+            if fg and sc.strip():
+                tokens.setdefault(sc.strip(), fg)
+    bg = colors.get("editor.background")
+    bg = bg if isinstance(bg, str) and HEX_RE.match(bg) else None
+
+    def col(*keys):
+        for k in keys:
+            v = tokens.get(k[6:]) if k.startswith("token:") else colors.get(k)
+            if isinstance(v, str) and HEX_RE.match(v):
+                rgb, h = hex_rgb(v), v.lstrip("#")
+                if len(h) in (4, 8):                      # alpha: blend over the editor background
+                    a = int(h[-2:] if len(h) == 8 else h[-1] * 2, 16) / 255
+                    under = hex_rgb(bg) if bg else (0, 0, 0)
+                    rgb = tuple(round(x * a + u * (1 - a)) for x, u in zip(rgb, under))
+                return "#%02x%02x%02x" % rgb
+        return None
+
+    def pair(fg, back):
+        return f"{fg or 'default'} on {back}" if back else fg
+    out = {
+        "base": pair(col("editor.foreground", "foreground"), col("editor.background")),
+        "head": pair(col("statusBar.foreground", "titleBar.activeForeground", "editor.foreground"),
+                     col("statusBar.background", "titleBar.activeBackground", "activityBar.background")),
+        "tab": pair(col("tab.inactiveForeground", "tab.activeForeground", "editor.foreground"),
+                    col("editorGroupHeader.tabsBackground", "tab.inactiveBackground", "sideBar.background")),
+        "sel": pair(col("list.activeSelectionForeground", "editor.foreground"),
+                    col("list.activeSelectionBackground", "editor.selectionBackground")),
+        "ok": col("terminal.ansiGreen", "token:string", "gitDecoration.addedResourceForeground"),
+        "warn": col("terminal.ansiYellow", "editorWarning.foreground", "list.warningForeground"),
+        "info": col("terminal.ansiCyan", "token:support.function", "terminal.ansiBlue", "textLink.foreground"),
+        "err": col("terminal.ansiRed", "editorError.foreground", "errorForeground"),
+        "brand": col("token:constant.numeric", "token:constant", "focusBorder", "button.background"),
+        "mag": col("terminal.ansiMagenta", "token:keyword", "token:storage"),
+        "dim": col("token:comment", "editorLineNumber.foreground", "descriptionForeground",
+                   "terminal.ansiBrightBlack"),
+    }
+    return {k: v for k, v in out.items() if v}
+
+
+def import_theme(path):
+    """A VS Code theme (.json) or a runai-tui theme (.yaml) -> ~/.config/runai-tui/themes/<name>.yaml.
+    -> the theme's name."""
+    path = os.path.expanduser(path)
+    with open(path, encoding="utf-8-sig") as f:
+        text = f.read()
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if path.endswith((".yaml", ".yml")):
+        data = yaml.safe_load(text)
+        if not isinstance(data, dict):
+            raise ValueError("not a mapping of style: colour")
+        styles = {str(k): v for k, v in data.items() if k != "name"}
+    else:
+        try:
+            data = json.loads(strip_jsonc(text))
+        except ValueError as e:
+            raise ValueError(f"not a VS Code theme (.json) or a .yaml theme: {e}")
+        if not isinstance(data, dict):
+            raise ValueError("not a VS Code colour theme")
+        styles = vscode_theme(data)
+        if not styles:
+            raise ValueError("no colours found" + (f" (it includes {data['include']}: import that one)"
+                                                   if data.get("include") else ""))
+    for k, v in styles.items():
+        if k not in THEME_KEYS:
+            raise ValueError(f"{k}: no such style (styles: {', '.join(THEME_KEYS)})")
+        parse_color(v)
+    title = str(data.get("name") or stem)
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "theme"
+    d = os.path.expanduser(THEME_DIRS[-1])
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, slug + ".yaml"), "w") as f:
+        f.write(f"# imported from {path}\n")
+        yaml.safe_dump(dict({"name": title}, **styles), f, sort_keys=False, allow_unicode=True)
+    return slug
+
+
 PHASE_STYLE = {"Running": ("●", "ok"), "Pending": ("◐", "warn"), "Initializing": ("◐", "info"),
                "Creating": ("◐", "info"), "Resuming": ("◐", "info"), "Completed": ("✔", "dim"),
                "Succeeded": ("✔", "dim"), "Failed": ("✖", "err"), "Stopped": ("■", "dim"),
@@ -2018,8 +2616,9 @@ class Tui:
         self.tab = tab
         self.project = project or cli_project() or ""
         self.mine, self.filter = True, ""
-        self.sel = {"wl": 0, "act": 0, "setup": 0}
-        self.top = {"wl": 0, "act": 0, "setup": 0}
+        self.sel = {"wl": 0, "act": 0, "setup": 0, "quota": 0, "apps": 0}
+        self.top = {"wl": 0, "act": 0, "setup": 0, "quota": 0, "apps": 0}
+        self.after_start = None          # {project, name, attach, t0}: G in the form, attach/shell once it runs
         self.dscroll = 0
         self.status, self.status_at = "", 0
         self.checks, self.check_progress = [], None
@@ -2028,6 +2627,10 @@ class Tui:
         self.shadow = {}
         curses.curs_set(0)
         curses.use_default_colors()
+        self.apply_theme()
+
+    def apply_theme(self, name=None):
+        """(Re)define the colour pairs from a theme; what is on screen changes with them."""
         c256 = curses.COLORS >= 256
         pairs = dict(zip(THEME_STYLES, [
             (curses.COLOR_WHITE, 17 if c256 else curses.COLOR_BLUE), (curses.COLOR_GREEN, -1),
@@ -2035,11 +2638,20 @@ class Tui:
             (curses.COLOR_BLACK, curses.COLOR_CYAN), (208 if c256 else curses.COLOR_YELLOW, -1),
             (curses.COLOR_MAGENTA, -1), (244 if c256 else curses.COLOR_WHITE, -1),
             (curses.COLOR_WHITE, 24 if c256 else curses.COLOR_BLUE)]))
-        for style, (fg, bg) in theme().items():         # colours this terminal lacks keep the built-in ones
-            if max(fg, bg if bg is not None else -1) < curses.COLORS:
+        base = (-1, -1)
+        for style, (fg, bg) in theme(name).items():     # colours this terminal lacks keep the built-in ones
+            if max(fg, bg if bg is not None else -1) >= curses.COLORS:
+                continue
+            if style == "base":
+                base = (fg, -1 if bg is None else bg)
+            else:
                 pairs[style] = (fg, pairs[style][1] if bg is None else bg)
-        for i, style in enumerate(THEME_STYLES, start=1):
-            curses.init_pair(i, *pairs[style])
+        for i, style in enumerate(THEME_STYLES, start=1):   # "terminal default" means the theme's base
+            fg, bg = pairs[style]
+            curses.init_pair(i, base[0] if fg == -1 else fg, base[1] if bg == -1 else bg)
+        nbase = len(THEME_STYLES) + 1
+        curses.init_pair(nbase, *base)
+        self.scr.bkgd(" ", curses.color_pair(nbase))
         self.C = {k: curses.color_pair(i) for i, k in enumerate(THEME_STYLES, start=1)}
         self.C["dim"] |= curses.A_DIM if not c256 else 0
         self.C[None] = 0
@@ -2146,7 +2758,7 @@ class Tui:
         head = f" ▲ {site_title(self.sess.claims)} · Run:ai   {who}"
         self.put(0, 0, head.ljust(w), self.C["head"] | curses.A_BOLD)
         if st.logged_in is False:
-            right = "✖ not logged in (4 → Setup)"
+            right = f"✖ not logged in ({T_SETUP + 1} → Setup)"
         elif st.error:
             right = f"✖ {st.error[:50]}"
         elif st.updated:
@@ -2173,7 +2785,8 @@ class Tui:
         self.put(1, x, " " * max(0, w - x), self.C["tab"])
         self.put(1, w - len(proj) - 1, proj, self.C["tab"] | curses.A_BOLD)
         body = (2, h - 4)                      # top row, height
-        [self.draw_overview, self.draw_workloads, self.draw_activity, self.draw_setup][self.tab](*body, w)
+        [self.draw_overview, self.draw_workloads, self.draw_activity, self.draw_org, self.draw_apps,
+         self.draw_setup][self.tab](*body, w)
         # status + keys
         if self.status and time.time() - self.status_at > 12:
             self.status = ""
@@ -2182,13 +2795,17 @@ class Tui:
         K = lambda a: key_name(KEYS[a])
         keys = {0: [(K("new"), "new"), (K("submit_files"), "submit files"), (K("project"), "project"),
                     ("2", "workloads")],
-                1: [("⏎", "shell"), (K("logs"), "logs"), (K("describe"), "describe"), (K("save"), "save YAML"),
+                1: [("⏎", "shell"), (K("attach"), "attach"), (K("logs"), "logs"), (K("describe"), "describe"),
+                    (K("save"), "save YAML"),
                     (K("delete"), "delete"), (K("toggle_mine"), "mine/all"), (K("filter"), "filter"),
                     (K("new"), "new")],
                 2: [("⏎", "go to"), (K("forget_done"), "forget done"), (K("new"), "new"),
                     (K("submit_files"), "submit files")],
-                3: [("⏎", "fix"), (K("fix_all"), "fix all"), (K("login"), "log in"), (K("logout"), "log out"),
-                    (K("refresh"), "re-check")]}[self.tab]
+                T_SETUP: [("⏎", "fix"), (K("fix_all"), "fix all"), (K("login"), "log in"),
+                          (K("logout"), "log out"), (K("refresh"), "re-check")],
+                T_QUOTA: [("⏎", "use project"), (K("project"), "project"), (K("refresh"), "refresh")],
+                T_APPS: [("⏎", "describe"), (K("app_submit"), "submit"), (K("app_delete"), "delete"),
+                    (K("refresh"), "refresh")]}[self.tab]
         keys += [(K("help"), "help"), (K("quit"), "quit")]
         x = 0
         for k, label in keys:
@@ -2205,8 +2822,9 @@ class Tui:
         h, w = self.scr.getmaxyx()
         try:
             rows = ["".join(self.shadow.get(y, [])).rstrip() for y in range(h)]
-            with open(self.dump, "w") as f:
+            with open(self.dump + ".tmp", "w") as f:
                 f.write("\n".join(rows) + "\n")
+            os.replace(self.dump + ".tmp", self.dump)          # readers never see a half-written frame
         except OSError:
             pass
 
@@ -2223,7 +2841,7 @@ class Tui:
                       [("groups  ", "dim"), (", ".join(cl.get("groups") or []) or "-", None)],
                       [("token   ", "dim"), (f"valid {dur(s.exp - time.time())} (renews itself)", None)]]
         else:
-            lines += [[("Not logged in.", "err")], [("Press 4 (Setup) and i to log in.", None)]]
+            lines += [[("Not logged in.", "err")], [(f"Press {T_SETUP + 1} (Setup) and i to log in.", None)]]
         lines += [[("site    ", "dim"), (s.base, None)], [("", None)]]
         with st.lock:
             mine = [x for x in st.workloads if st.mine(x)]
@@ -2246,7 +2864,7 @@ class Tui:
             if bad:
                 lines += [[("", None)], [(f"⚠ {len(bad)} setup item(s) need attention: ", "warn"),
                                          (", ".join(c.title for c in bad)[:left_w], None)],
-                          [("  press 4 (Setup), then A to fix", "dim")]]
+                          [(f"  press {T_SETUP + 1} (Setup), then A to fix", "dim")]]
         box_h = len(lines) + 2 if w >= 110 else min(len(lines) + 2, height // 2)
         if w >= 110:
             box_h = height - min(height // 3, 12) if st.watch else height
@@ -2652,6 +3270,8 @@ class Tui:
                     attr = self.C["sel"] | curses.A_BOLD if top + i == sel else 0
                     self.put(y0 + 1 + i, x0 + 1, f" {o}".ljust(bw - 2), attr, bw - 2)
                 self.scr.refresh()
+                if self.dump:
+                    self.dump_screen()
                 k = self.scr.getch()
                 if k in (27, ord("q")):
                     return None
@@ -2664,6 +3284,95 @@ class Tui:
         finally:
             self.scr.timeout(250)
 
+    def choose_theme(self):
+        """Theme picker: moving previews the theme, Enter keeps it, i imports a VS Code theme."""
+        start = theme_choice()[0]
+        current, msg = start, ""
+        self.scr.timeout(-1)
+        try:
+            while True:
+                self.scr.timeout(-1)                    # prompt() and confirm() leave it at 250 ms
+                themes = load_themes()
+                names = list(themes)
+                if current not in names:
+                    current = "default"
+                sel = names.index(current)
+                self.apply_theme(current)
+                self.draw()
+                h, w = self.scr.getmaxyx()
+                bw = min(w - 4, 64)
+                rows = min(len(names), max(3, h - 12))
+                bh = rows + 7
+                y0, x0 = max(1, (h - bh) // 2), (w - bw) // 2
+                for i in range(bh):
+                    self.put(y0 + i, x0, " " * bw, 0)
+                self.box(y0, x0, bh, bw, f"Colour theme ({len(names)})", True)
+                top = max(0, min(sel - rows + 1, len(names) - rows))
+                user_dir = os.path.expanduser(THEME_DIRS[-1])
+                for i, n in enumerate(names[top:top + rows]):
+                    t = themes[n]
+                    src = ("built-in" if t["_src"] == "built-in" else
+                           "yours" if t["_src"].startswith(user_dir) else "site")
+                    mark = "●" if n == start else " "
+                    line = f" {mark} {str(t.get('name') or n)[:bw - 18]}".ljust(bw - 12) + src.rjust(8)
+                    attr = self.C["sel"] | curses.A_BOLD if top + i == sel else 0
+                    self.put(y0 + 1 + i, x0 + 1, line.ljust(bw - 2), attr, bw - 2)
+                y = y0 + 2 + rows
+                x = x0 + 3
+                for style in ("ok", "warn", "info", "err", "brand", "mag", "dim"):
+                    self.put(y, x, style, self.C[style] | curses.A_BOLD)
+                    x += len(style) + 2
+                self.put(y, x, " sel ", self.C["sel"] | curses.A_BOLD)
+                self.put(y + 1, x0 + 3, " head ", self.C["head"] | curses.A_BOLD)
+                self.put(y + 1, x0 + 10, " tab ", self.C["tab"])
+                self.put(y + 2, x0 + 2, (msg or f"previewing {themes[current].get('name') or current}")[:bw - 4],
+                         self.C["warn" if msg.startswith("✖") else "dim"], bw - 4)
+                self.put(y0 + bh - 2, x0 + 2, "j/k preview  ⏎ use  i import  d delete  Esc cancel"[:bw - 4],
+                         self.C["info"], bw - 4)
+                self.scr.refresh()
+                if self.dump:
+                    self.dump_screen()
+                msg = ""
+                k = self.scr.getch()
+                if k in (27, ord("q")):
+                    self.apply_theme(start)
+                    return
+                if k in (10, 13, curses.KEY_ENTER):
+                    try:
+                        save_theme_choice(current)
+                        self.flash(f"theme: {themes[current].get('name') or current} "
+                                   f"(saved in {THEME_CHOICE})")
+                    except OSError as e:
+                        self.flash(f"✖ theme not saved: {e}")
+                    return
+                if k in (curses.KEY_DOWN, ord("j")):
+                    current = names[min(len(names) - 1, sel + 1)]
+                elif k in (curses.KEY_UP, ord("k")):
+                    current = names[max(0, sel - 1)]
+                elif k == ord("i"):
+                    path = self.prompt("import a VS Code theme (.json) or a runai-tui theme (.yaml)",
+                                       complete_paths=True)
+                    if path:
+                        try:
+                            current = import_theme(path)
+                            msg = f"imported as {current}: Enter keeps it"
+                        except (OSError, ValueError, yaml.YAMLError) as e:
+                            msg = f"✖ {str(e).splitlines()[0]}"
+                elif k in (ord("d"), curses.KEY_DC):
+                    if not themes[current]["_src"].startswith(user_dir):
+                        msg = "✖ only themes you imported can be deleted"
+                    elif self.confirm(f"delete theme {current}?"):
+                        try:
+                            os.remove(themes[current]["_src"])
+                            if start == current:
+                                save_theme_choice("default")
+                                start = "default"
+                            current = names[max(0, sel - 1)]
+                        except OSError as e:
+                            msg = f"✖ {e}"
+        finally:
+            self.scr.timeout(250)
+
     def pager(self, title, text):
         lines = text.split("\n")
         top, search = 0, ""
@@ -2671,6 +3380,7 @@ class Tui:
         try:
             while True:
                 self.scr.erase()
+                self.shadow = {}
                 h, w = self.scr.getmaxyx()
                 self.put(0, 0, f" {title}".ljust(w), self.C["head"] | curses.A_BOLD)
                 for i, l in enumerate(lines[top:top + h - 2]):
@@ -2680,6 +3390,8 @@ class Tui:
                 self.put(h - 1, 0, " ↑/↓ PgUp/PgDn g/G scroll · / search · n next · q back ", self.C["sel"])
                 self.put(h - 1, w - len(pos) - 1, pos, self.C["dim"])
                 self.scr.refresh()
+                if self.dump:
+                    self.dump_screen()
                 k = self.scr.getch()
                 if k in (ord("q"), 27, 10):
                     return
@@ -2785,8 +3497,8 @@ class Tui:
             c = conts[i]
         return p["name"], c
 
-    def do_shell(self):
-        w = self.need_workload()
+    def do_shell(self, w=None):
+        w = w or self.need_workload()
         if not w:
             return
         if w.get("phase") in TERMINAL:
@@ -2799,6 +3511,253 @@ class Tui:
         argv += (["--pod", pod] if pod else []) + (["-c", cont] if cont else [])
         argv += ["-i", "-t", "--wait-timeout", "120s", "--", "sh", "-c", SHELL_CMD]
         self.external(f"shell in {w['name']}", argv, "exit (or Ctrl-D) returns to runai-tui", pause=False)
+
+    def do_attach(self, w=None):
+        """The workload's main process on this terminal (its stdin/stdout), not a new shell."""
+        w = w or self.need_workload()
+        if not w:
+            return
+        if w.get("phase") in TERMINAL:
+            self.flash(f"{w['name']} is {w.get('phase')}: nothing to attach to (l shows its logs)")
+            return
+        pod, cont = self.pick_pod(w)
+        if pod is None:
+            return
+        sub = attach_words(w)
+        ns = w.get("namespace") or f"runai-{w['projectName']}"
+        runai_argv = None
+        if sub:
+            runai_argv = [RUNAI] + sub + ["attach", w["name"], "-p", w["projectName"]]
+            runai_argv += (["--pod", pod] if pod else []) + (["-c", cont] if cont else [])
+            runai_argv += ["-i", "-t", "--wait-timeout", "120s"]
+        note = ("This is the program's own terminal: what you type goes to it; exit (or Ctrl-D) ends the\n"
+                "program, and with it the workload. If nothing shows, press Enter. ")
+        if pod and kubectl_can_detach():
+            argv = [KUBECTL, "attach", "-it", pod, "-n", ns] + (["-c", cont] if cont else [])
+            rc = self.external(f"attach to {w['name']}", argv, note + "Ctrl-P Ctrl-Q detaches and leaves it running.")
+            if rc == 0 or not runai_argv or not self.confirm(
+                    f"kubectl attach failed (exit {rc}): try runai attach (it cannot detach)?", True):
+                return
+        elif not runai_argv:
+            self.flash("no pod to attach to" if not pod else "this kubectl cannot attach (needs --detach-keys)")
+            return
+        self.external(f"attach to {w['name']}", runai_argv,
+                      note + "runai attach cannot detach: to leave it running, close this terminal.")
+
+    def show_pvcs(self):
+        proj = self.project or cli_project()
+        if not proj:
+            self.flash("pick a project first (p)")
+            return
+        ns = project_namespace(self.st, proj)
+        try:
+            got, why = self.busy("PVCs ...", lambda: list_pvcs(proj, ns))
+        except Exception as e:
+            self.flash(f"PVCs: {e}")
+            return
+        used = {}
+        with self.st.lock:
+            for w in self.st.workloads:
+                if w.get("projectName") == proj:
+                    for c in (w.get("pvcs") or w.get("datasources") or []):
+                        n = c.get("claimName") or c.get("name") if isinstance(c, dict) else None
+                        if n:
+                            used.setdefault(n, []).append(w["name"])
+        head = f"{'NAME':<28} {'SIZE':>7}  {'STATUS':<8} {'ACCESS':<8} {'CLASS':<14} MANAGED BY"
+        lines = [f"PVCs in project {proj} (namespace {ns})", "", head, "-" * len(head)]
+        lines += [pvc_line(d) + (f"   used by {', '.join(used[d['name']])}" if d["name"] in used else "")
+                  for d in got] or ["(none)"]
+        lines += ["", "In the form (n): Existing PVCs → + picks one of these and asks where to mount it.",
+                  f"M in the form saves a mount as a Run:ai data source. {why}".rstrip()]
+        self.pager(f"PVCs · {proj}", "\n".join(lines))
+
+    # Quota and Apps tabs ---------------------------------------------------------------------
+    def draw_org(self, top, height, w):
+        st = self.st
+        with st.lock:
+            rows = org_rows(st.projects, st.departments)
+            err = st.dept_error
+        self.box(top, 0, height, w, "Quota by department · GPUs allocated / guaranteed", True)
+        inner = w - 4
+        if not rows:
+            self.put(top + 1, 2, "no project data yet" if st.logged_in is not False else "log in to see quotas",
+                     self.C["dim"])
+            return
+        flat = []                                # (kind, name, totals, project)
+        for dname, dt, kids in rows:
+            flat.append(("dept", dname, dt, None))
+            flat += [("proj", p["name"], t, p) for p, t in kids]
+        notes = ["Green: within the guaranteed quota (┆). Yellow: over quota - borrowed idle GPUs, preemptible.",
+                 "limit: most a project may use (∞ none) · pend: GPUs requested but waiting · weight: share of idle "
+                 "GPUs over quota."]
+        if err:
+            notes.insert(0, f"departments: {err} - department totals are added up from your projects")
+        lines = height - 3 - len(notes)
+        t0, sel = self.scroll_list("quota", len(flat), lines)
+        bw = max(12, min(36, inner - 66))
+        hdr = f"{'':<24}{'GPU':<{bw + 2}}{'alloc':>6} {'quota':>6} {'over':>6} {'limit':>6} {'pend':>5} {'weight':>6}"
+        self.put(top + 1, 2, hdr, self.C["dim"], inner)
+        for i, (kind, name, t, p) in enumerate(flat[t0:t0 + lines]):
+            y = top + 2 + i
+            quota = t["quota"]
+            limit = t.get("limit")
+            over = max(0, t["alloc"] - (quota or 0)) if quota is not None else 0
+            label = (f"▸ {name}" if kind == "dept" else f"   {name}")[:23]
+            attr = self.C["sel"] | curses.A_BOLD if t0 + i == sel else (self.C["brand"] | curses.A_BOLD if kind == "dept"
+                                                                        else 0)
+            mark = "◂" if kind == "proj" and name == self.project else " "
+            self.put(y, 1, f" {label:<23}".ljust(24) + mark, attr, 25)
+            self.cells(y, 26, quota_cells(bw, t["alloc"], quota or 0, limit), {})
+            if kind == "dept":
+                txt = (f"  {num(t['alloc']):>5} {num(quota) if quota is not None else '-':>6} "
+                       f"{num(over) if over else '':>6}" + ("" if t["known"] else "   (projects: "
+                                                             f"{num(t['projects_quota'])} guaranteed)"))
+            else:
+                txt = (f"  {num(t['alloc']):>5} {num(quota):>6} {num(over) if over else '':>6} "
+                       f"{num(limit) if limit is not None else '∞':>6} {num(t['pending']) if t['pending'] else '':>5} "
+                       f"{num(t['weight']) if t['weight'] else '':>6}")
+            self.put(y, 26 + bw, txt, self.C["warn"] if over else 0, inner - bw - 24)
+        for j, n in enumerate(notes):
+            self.put(top + height - 1 - len(notes) + j, 2, n, self.C["warn" if n.startswith("departments") else "dim"],
+                     inner)
+
+    def quota_enter(self):
+        with self.st.lock:
+            rows = org_rows(self.st.projects, self.st.departments)
+        flat = []
+        for dname, _, kids in rows:
+            flat.append(("dept", dname))
+            flat += [("proj", p["name"]) for p, _ in kids]
+        if not flat:
+            return
+        kind, name = flat[min(self.sel["quota"], len(flat) - 1)]
+        if kind == "proj":
+            self.project = name
+            self.flash(f"project {name} (p switches; the CLI default stays {cli_project() or '-'})")
+        else:
+            self.flash(f"department {name}: Enter on one of its projects shows that project")
+
+    def visible_apps(self):
+        with self.st.lock:
+            apps = list(self.st.apps or [])
+        return [a for a in apps if not self.project or app_info(a)["project"] in ("", self.project)]
+
+    def draw_apps(self, top, height, w):
+        st = self.st
+        apps = self.visible_apps()
+        lw = max(46, w * 45 // 100)
+        self.box(top, 0, height, lw, f"AI applications {len(apps)} · {self.project or 'all projects'}", True)
+        if st.apps is None:
+            msg = st.apps_error or ("loading ..." if st.logged_in is not False else "log in first")
+            for i, part in enumerate(textwrap.wrap(msg, lw - 4)[:height - 2]):
+                self.put(top + 1 + i, 2, part, self.C["warn" if st.apps_error else "dim"], lw - 4)
+            self.box(top, lw, height, w - lw, "Details")
+            return
+        if not apps:
+            self.put(top + 1, 2, f"none: {key_name(KEYS['app_submit'])} submits one from a Helm chart", self.C["dim"],
+                     lw - 4)
+        t0, sel = self.scroll_list("apps", len(apps), height - 2)
+        nw = max(10, lw - 34)
+        for i, a in enumerate(apps[t0:t0 + height - 2]):
+            info = app_info(a)
+            line = f" {info['name'][:nw]:<{nw}} {info['status'][:11]:<11} {info['project'][:16]:<16}"
+            attr = self.C["sel"] | curses.A_BOLD if t0 + i == sel else 0
+            self.put(top + 1 + i, 1, line.ljust(lw - 2), attr, lw - 2)
+        dw = w - lw
+        self.box(top, lw, height, dw, "Details")
+        if not apps:
+            L = ["AI applications are Helm charts that Run:ai deploys as a group of workloads",
+                 "(a model server with its UI, a vector database, ...).", "",
+                 f"{key_name(KEYS['app_submit'])} asks for a name, a chart URL (.tgz), and optionally a values file,",
+                 "--set overrides and an NGC credential, then runs `runai application submit`."]
+        else:
+            a = apps[sel]
+            info = app_info(a)
+            L = [f"{k:<10}{info[k]}" for k in ("name", "project", "status", "chart", "created", "workloads")
+                 if info[k] not in ("", None)]
+            L += ["", "-- from the API --"] + yaml.safe_dump(a, sort_keys=False, width=dw - 6).splitlines()
+        for i, line in enumerate(L[:height - 2]):
+            self.put(top + 1 + i, lw + 2, line, self.C["dim"] if line.startswith("--") else 0, dw - 4)
+
+    def selected_app(self):
+        apps = self.visible_apps()
+        if not apps:
+            self.flash("no application selected")
+            return None
+        info = app_info(apps[min(self.sel["apps"], len(apps) - 1)])
+        if not info["project"] and not self.project:
+            self.flash("its project is unknown: pick one with p first")
+            return None
+        info["project"] = info["project"] or self.project
+        return info
+
+    def app_describe(self):
+        a = self.selected_app()
+        if not a:
+            return
+        argv = [RUNAI, "application", "describe", a["name"], "-p", a["project"]]
+        rc, out, err = self.busy("describe ...", lambda: cmd(argv, timeout=60))
+        log_action(f"describe application {a['name']}", argv, rc)
+        self.pager(f"application {a['name']} · {a['project']}", (out + err) or f"exit {rc}")
+
+    def app_delete(self):
+        a = self.selected_app()
+        if not a or not self.confirm(f"delete application {a['name']} (and its workloads)?"):
+            return
+        argv = [RUNAI, "application", "delete", a["name"], "-p", a["project"], "-y"]
+        rc, out, err = self.busy("deleting ...", lambda: cmd(argv, timeout=120))
+        log_action(f"delete application {a['name']}", argv, rc, out + err)
+        self.flash((last_line(out, err) or f"deleted {a['name']}") if rc == 0 else f"✖ {first_error(err, out)}")
+        self.poller.wake()
+
+    def app_submit(self):
+        proj = self.project or cli_project()
+        if not proj:
+            i = self.pick("project", self.projects())
+            if i is None:
+                return
+            proj = self.projects()[i]
+        name = self.prompt(f"application name (in {proj})")
+        if not name:
+            return
+        if not NAME_RE.match(name):
+            self.flash("names: lowercase letters, digits and '-'")
+            return
+        url = self.prompt("Helm chart URL (.tgz)")
+        if not url:
+            return
+        values = self.prompt("values file (optional, Enter skips)", complete_paths=True)
+        if values is None:
+            return
+        sets = self.prompt("--set overrides (optional: key=value; key2=value2)")
+        if sets is None:
+            return
+        cred = self.prompt("NGC API key credential for a private chart (optional)")
+        if cred is None:
+            return
+        argv = [RUNAI, "application", "submit", name, "-p", proj, "--chart-url", url]
+        if values:
+            argv += ["--values", os.path.expanduser(values)]
+        for kv in [x.strip() for x in sets.split(";") if x.strip()]:
+            argv += ["--set", kv]
+        if cred:
+            argv += ["--credential", cred]
+        if not self.confirm(f"run {' '.join(shlex.quote(a) for a in argv[1:])[:90]}?", True):
+            return
+        env = {"RUNAI_TUI_PROJECT": proj, "RUNAI_TUI_LABEL": name, "RUNAI_TUI_ARGV": json.dumps(argv)}
+        ok, _, msg = run_hooks("pre_submit", "", env, name)
+        if not ok:
+            self.flash(f"✖ {msg}")
+            return
+        rc, out, err = self.busy(f"submitting {name} ...", lambda: cmd(argv, timeout=300))
+        log_action(f"submit application {name}", argv, rc, out + err)
+        if rc != 0:
+            self.flash(f"✖ {first_error(err, out)}")
+            return
+        run_hooks("post_submit", "", {"RUNAI_TUI_PROJECT": proj, "RUNAI_TUI_NAMES": name,
+                                      "RUNAI_TUI_METHOD": "runai application submit"}, name)
+        self.flash(f"✔ {last_line(out, err) or 'submitted ' + name}")
+        self.poller.wake()
 
     def do_logs(self, follow=False):
         w = self.need_workload()
@@ -3007,6 +3966,7 @@ class Tui:
              ("memory", "Memory", "text", None),
              ("run_as_me", "Run as me + home", "bool", None),
              ("datasources", "Data sources", "multi", assets["datasources"]),
+             ("pvcs", "Existing PVCs", "pvcs", None),
              ("binds", "Bind mounts", "multi", list(site_binds()[0])),
              ("extra_binds", "Extra bind mounts", "binds", None),
              ("scratch", "Scratch /scratch", "text", None),
@@ -3043,7 +4003,7 @@ class Tui:
             return
         s = e.get("spec") or {}
         v["image"] = s.get("image", v["image"])
-        v["command"] = " ".join(x for x in (s.get("command"), s.get("args")) if x)
+        v["command"] = join_command(s.get("command"), s.get("args"))
         v["run_as_me"] = s.get("uidGidSource") == "fromIdpToken" or v["run_as_me"]
 
     def apply_compute(self, v):
@@ -3059,15 +4019,20 @@ class Tui:
         if not t:
             return
         vals, notes = template_values(t, self.st)
-        if vals.get("env"):
+        if vals.get("kind") and vals["kind"] != v["kind"]:
+            v["kind"] = vals["kind"]
+            self.form_changed(v, "kind")
+        if vals.get("env") and vals["env"] != "(custom image)":
             v["env"] = vals["env"]
             self.apply_env(v)
-        if vals.get("compute"):
+        if vals.get("compute") and vals["compute"] != "(custom)":
             v["compute"] = vals["compute"]
             self.apply_compute(v)
-        for k in ("command", "env_vars", "datasources"):
-            if k in vals:
-                v[k] = vals[k]
+        for k, val in vals.items():
+            if k in FORM_EMPTY and k not in ("kind", "compute") and not (k == "env" and val != "(custom image)"):
+                v[k] = val
+        if vals.get("compute") == "(custom)":
+            v["compute"] = "(custom)"
         self.flash(f"template {v['template']} applied" + (f" ({'; '.join(notes)})" if notes else ""))
 
     def form_defaults(self):
@@ -3154,6 +4119,8 @@ class Tui:
                     attr = self.C["sel"] | curses.A_BOLD if top + i == sel else 0
                     self.put(y0 + 1 + i, x0 + 1, f" [{'x' if on[top + i] else ' '}] {o}".ljust(bw - 2), attr, bw - 2)
                 self.scr.refresh()
+                if self.dump:
+                    self.dump_screen()
                 k = self.scr.getch()
                 if k in (27, ord("q")):
                     return None
@@ -3168,12 +4135,17 @@ class Tui:
         finally:
             self.scr.timeout(250)
 
-    def edit_binds(self, text):
-        """Modal list of extra bind mounts -> the form text. Rows are typed in place and the box
-        grows with them: a/Enter add, e edit, Space ro/rw, d delete, q done."""
-        binds, _ = parse_binds(text)
+    def edit_binds(self, text, pvc_project=None):
+        """Modal list of extra bind mounts (or, with pvc_project, of existing PVCs) -> the form text.
+        Rows are typed in place and the box grows with them: a/Enter add, e edit, Space ro/rw,
+        d delete, q done."""
+        pvc = pvc_project is not None
+        binds, _ = parse_pvcs(text) if pvc else parse_binds(text)
         sel = 0
-        note = "host path is on the compute node; read-only unless [rw]"
+        title = "Existing PVCs" if pvc else "Extra bind mounts"
+        note = (f"claims in project {pvc_project}; read-write unless [ro]" if pvc else
+                "host path is on the compute node; read-only unless [rw]")
+        claims = []
 
         def draw(adding=False, typing=False):
             """Paint the box (with an empty row to type into when adding) -> row index -> (y, x, width)."""
@@ -3187,7 +4159,7 @@ class Tui:
             top = max(0, min(sel - vis + 1, n - vis))
             for i in range(bh):
                 self.put(y0 + i, x0, " " * bw, 0)
-            self.box(y0, x0, bh, bw, f"Extra bind mounts ({len(binds)})", True)
+            self.box(y0, x0, bh, bw, f"{title} ({len(binds)})", True)
             for j in range(top, min(n, top + vis)):
                 if j < len(binds):
                     b = binds[j]
@@ -3195,14 +4167,14 @@ class Tui:
                 elif adding:
                     line, attr = "", 0
                 else:
-                    line, attr = " + add a bind mount", self.C["info"]
+                    line, attr = " + add a PVC" if pvc else " + add a bind mount", self.C["info"]
                 if j == sel and not (adding or typing):
                     attr = self.C["sel"] | curses.A_BOLD
                 self.put(y0 + 1 + j - top, x0 + 1, line.ljust(bw - 2), attr, bw - 2)
             msg = self.status
             self.put(y0 + bh - 3, x0 + 2, msg or note, self.C["warn" if msg else "dim"], bw - 4)
             if adding or typing:
-                hint = "⏎ next  Tab completes  Esc cancels"
+                hint = "⏎ next  Esc cancels" if pvc else "⏎ next  Tab completes  Esc cancels"
             elif sel < len(binds):
                 hint = "a/⏎ add  e edit  Space ro/rw  d delete  q done"
             else:
@@ -3213,8 +4185,44 @@ class Tui:
                 self.dump_screen()
             return lambda j: (y0 + 1 + j - top, x0 + 2, bw - 4)
 
+        def ask_pvc(j, b=None):
+            """Pick a claim (with its size), then type its mount path into row j."""
+            adding = b is None
+            if not claims:
+                try:
+                    got, why = self.busy("PVCs ...", lambda: list_pvcs(pvc_project, project_namespace(
+                        self.st, pvc_project)))
+                except Exception as e:
+                    got, why = [], str(e)
+                claims[:] = got
+                if why:
+                    self.flash(why)
+            if not claims:
+                self.flash(f"no PVCs in {pvc_project}" + (f": {self.status}" if self.status else ""))
+                return None
+            names = [c["name"] for c in claims]
+            i = self.pick(f"PVC in {pvc_project}: name, size, status, access, class", [pvc_line(c) for c in claims],
+                          pvc_line(claims[names.index(b["host"])]) if b and b["host"] in names else None)
+            self.status = ""
+            if i is None:
+                return None
+            claim = names[i]
+            mode = "[ro] " if b and b["ro"] else "[rw] "
+            pos = draw(adding, True)(j)
+            path = self.prompt(f"{mode}{claim}  →  ", b["path"] if b and b["host"] == claim else f"/data/{claim}",
+                               at=pos, redraw=lambda: draw(adding, True))
+            self.status = ""
+            if not path:
+                return None
+            if not path.startswith("/") or ":" in path or "," in path:
+                self.flash(f"'{path}': an absolute path without ':' or ','")
+                return None
+            return {"host": claim, "path": path, "ro": b["ro"] if b else False, "type": ""}
+
         def ask(j, b=None):
             """Type a bind into row j (b: the one being edited) -> bind or None."""
+            if pvc:
+                return ask_pvc(j, b)
             adding = b is None
             mode = "[ro] " if adding or b["ro"] else "[rw] "
             pos = draw(adding, True)(j)
@@ -3238,15 +4246,15 @@ class Tui:
                 return None
             return {"host": host, "path": path, "ro": b["ro"] if b else True, "type": ""}
 
-        self.scr.timeout(-1)
         try:
             while True:
+                self.scr.timeout(-1)                    # prompt() leaves it at 250 ms
                 sel = max(0, min(sel, len(binds)))
                 draw()
                 k = self.scr.getch()
                 self.status = ""
                 if k in (27, ord("q")):
-                    return format_binds(binds)
+                    return format_pvcs(binds) if pvc else format_binds(binds)
                 if k in (curses.KEY_DOWN, ord("j")):
                     sel += 1
                 elif k in (curses.KEY_UP, ord("k")):
@@ -3275,7 +4283,7 @@ class Tui:
             return
         v = self.form_defaults()
         acts = {KEYS["form_submit"]: "S", KEYS["form_write"]: "W", KEYS["form_edit"]: "E",
-                KEYS["form_presets"]: "P"}
+                KEYS["form_presets"]: "P", KEYS["form_go"]: "G", KEYS["form_runai"]: "M"}
         sel, pscroll = 0, 0
         self.scr.timeout(-1)
         try:
@@ -3309,8 +4317,8 @@ class Tui:
                         i = choices.index(v[key]) if v[key] in choices else 0
                         v[key] = choices[(i + (-1 if k in (curses.KEY_LEFT, "h") else 1)) % len(choices)]
                         self.form_changed(v, key)
-                elif k in ("\n", "\r", curses.KEY_ENTER, " ") and typ == "binds":
-                    v[key] = self.edit_binds(v[key])
+                elif k in ("\n", "\r", curses.KEY_ENTER, " ") and typ in ("binds", "pvcs"):
+                    v[key] = self.edit_binds(v[key], v["project"] if typ == "pvcs" else None)
                     self.scr.timeout(-1)
                 elif k in ("\n", "\r", curses.KEY_ENTER, " ") and typ == "multi":
                     got = self.pick_many(fields[sel][1].strip(), choices, v[key])
@@ -3334,6 +4342,9 @@ class Tui:
                             self.form_changed(v, key)
                 elif acts.get(k) == "P":
                     self.form_presets(v)
+                    self.scr.timeout(-1)
+                elif acts.get(k) == "M":
+                    self.form_save_runai(v)
                     self.scr.timeout(-1)
                 elif acts.get(k):
                     if self.form_action(acts[k], v, man, argv, warn):
@@ -3361,8 +4372,15 @@ class Tui:
             v["gpu_amount"] = "0.5" if v["gpu"] == "fraction" else "1"
 
     def form_action(self, k, v, man, argv, warn):
-        """S submit, W write, E edit+submit. -> True when the form is done."""
+        """S submit, W write, E edit+submit, G submit and attach/shell in. -> True when the form is done."""
         proj = v["project"]
+        go = k == "G"
+        if go:
+            k = "S"
+            attach = not man and v["env"] == "(custom image)" and not v["command"].strip()
+            if attach:                           # the image's own program (e.g. bash) on a terminal
+                at = argv.index("--command") if "--command" in argv else len(argv)
+                argv = argv[:at] + ["--stdin", "--tty"] + argv[at:]
         if k == "W" or (k == "E" and man):
             ext = ".yaml" if man else ".sh"
             path = self.prompt("write to", os.path.join(SAVE_DIR, v["name"] + ext), complete_paths=True)
@@ -3414,7 +4432,100 @@ class Tui:
             self.start_batch([{"file": path, "label": v["name"], "project": proj}])
         else:
             self.start_batch([{"argv": argv, "label": v["name"], "project": proj, "names": [v["name"]]}])
+        if go:
+            self.after_start = {"project": proj, "name": v["name"], "attach": attach, "t0": time.time()}
         return True
+
+    def form_save_runai(self, v):
+        """M in the form: create an environment, compute resource, data source or workload template
+        from the form, in the form's project (visible in the Run:ai UI too)."""
+        p = self.st.project(v["project"])
+        if not p:
+            self.flash("no project")
+            return
+        binds = form_binds(v)[0]
+        pvcs = parse_pvcs(v.get("pvcs"))[0]
+        opts = [("template", f"workload template: the whole form ({v['kind']})"),
+                ("environment", f"environment: {v['image'] or '(no image)'}" + (" + command" if v["command"] else "")
+                 + (" + run as me" if v["run_as_me"] else "")),
+                ("compute", f"compute resource: {v['cpu'] or '-'} CPU, {v['memory'] or '-'}, GPU {v['gpu']}"
+                 + (f" {v['gpu_amount']}" if v["gpu"] != "none" else "") + (", large /dev/shm" if v["shm"] else ""))]
+        opts += [("bind", f"data source: host path {b['host']} → {b['path']}", b) for b in binds]
+        opts += [("pvc", f"data source: PVC {c['host']} → {c['path']}", c) for c in pvcs]
+        i = self.pick(f"save to Run:ai, in project {p['name']}", [o[1] for o in opts])
+        if i is None:
+            return
+        what = opts[i]
+        item = what[2] if len(what) > 2 else None
+        default = {"template": v["name"], "environment": (v["image"].split("/")[-1].split(":")[0] or "env"),
+                   "compute": "cpu{}-{}".format(v["cpu"] or 0, "gpu" + v["gpu_amount"] if v["gpu"] != "none" else
+                                               "nogpu").replace(".", "p")}.get(what[0])
+        if item:
+            default = os.path.basename(item["host"].rstrip("/")) or "root" if what[0] == "bind" else item["host"]
+        name = self.prompt(f"name for the {what[0] if what[0] not in ('bind', 'pvc') else 'data source'}",
+                           re.sub(r"[^a-z0-9-]+", "-", (default or "").lower()).strip("-"))
+        if not name:
+            return
+        if not NAME_RE.match(name):
+            self.flash("names: lowercase letters, digits and '-'")
+            return
+        desc = f"saved from runai-tui by {self.sess.email or getpass.getuser()}"
+        api = CFG["api"]
+        notes = []
+        try:
+            if what[0] == "template":
+                tkind, body, notes = template_body(name, v, self.st, desc)
+                path, key = f"{api['templates']}/{tkind}", "templates"
+            elif what[0] == "environment":
+                if not v["image"].strip():
+                    self.flash("no image to save")
+                    return
+                path, body, key = api["environments"], environment_body(name, v, p, desc), "environments"
+            elif what[0] == "compute":
+                path, body, key = api["computes"], {"meta": asset_meta(name, p, desc), "spec": form_compute(v)}, \
+                    "computes"
+            elif what[0] == "bind":
+                path, key = f"{api['datasources']}/host-path", "datasources"
+                body = {"meta": asset_meta(name, p, desc),
+                        "spec": {"path": item["host"], "mountPath": item["path"], "readOnly": item["ro"]}}
+            else:
+                path, key = f"{api['datasources']}/pvc", "datasources"
+                body = {"meta": asset_meta(name, p, desc), "spec": {
+                    "claimName": item["host"], "path": item["path"], "existingPvc": True, "readOnly": item["ro"]}}
+        except ValueError as e:
+            self.flash(str(e))
+            return
+        try:
+            self.busy(f"creating {name} ...", lambda: self.sess.api(path, "POST", body))
+        except ApiError as e:
+            log_action(f"save {what[0]} {name} to Run:ai: {e}")
+            msg = str(e)
+            if msg.startswith("403"):
+                msg += " (your role may not create these in this project: ask an administrator)"
+            self.flash(f"✖ {what[0]} {name}: {msg}")
+            return
+        log_action(f"saved {what[0]} {name} to Run:ai project {p['name']}", ["POST", path])
+        try:                                     # refresh that list now, and use what was saved
+            fresh = sorted(fetch_assets(self.sess, key), key=lambda e: (e.get("meta") or {}).get("name", ""))
+            with self.st.lock:
+                setattr(self.st, {"environments": "envs"}.get(key, key), fresh)
+        except ApiError:
+            pass
+        if what[0] == "environment":
+            v["env"] = name
+        elif what[0] == "compute":
+            v["compute"] = name
+        elif what[0] == "template":
+            v["template"] = name
+        elif what[0] in ("bind", "pvc"):
+            if what[0] == "bind":
+                v["extra_binds"] = format_binds([b for b in parse_binds(v["extra_binds"])[0] if b != item])
+                v["binds"] = [n for n in v["binds"] if site_binds()[0].get(n) != item]
+            else:
+                v["pvcs"] = format_pvcs([c for c in pvcs if c != item])
+            v["datasources"] = list(v["datasources"]) + [name]
+        self.flash(f"✔ saved {what[0] if what[0] not in ('bind', 'pvc') else 'data source'} {name} in {p['name']}"
+                   + (f" ({'; '.join(notes)})" if notes else "") + "; the form now uses it")
 
     def draw_form(self, fields, v, sel, preview, warn, pscroll):
         self.scr.erase()
@@ -3429,8 +4540,8 @@ class Tui:
             val = v[key]
             if typ == "multi":
                 val = ", ".join(val) or "(none)"
-            elif typ == "binds":
-                n = len(parse_binds(val)[0])
+            elif typ in ("binds", "pvcs"):
+                n = len((parse_pvcs if typ == "pvcs" else parse_binds)(val)[0])
                 val = f"{n}: {val}" if n else "(none) - Enter to add"
             elif typ == "bool":
                 val = "[x] yes" if val else "[ ] no"
@@ -3468,7 +4579,8 @@ class Tui:
             self.put(2 + i, lw + 2, l, self.C.get(style, 0), pw - 4)
         K = lambda a: key_name(KEYS[a])
         keys = [("↑↓", "field"), ("⏎ ←→", "change"), (K("form_submit"), "submit"), (K("form_write"), "write YAML"),
-                (K("form_edit"), "edit+submit"), (K("form_presets"), "presets"), ("Esc", "cancel")]
+                (K("form_edit"), "edit+submit"), (K("form_go"), "submit+attach"),
+                (K("form_runai"), "save to Run:ai"), (K("form_presets"), "presets"), ("Esc", "cancel")]
         x = 0
         for k, label in keys:
             if x + len(k) + len(label) + 4 > w:
@@ -3511,6 +4623,8 @@ class Tui:
         kind = c.fix[1]
         if kind == "login":
             self.do_login()
+        elif kind == "theme":
+            self.choose_theme()
         elif kind == "project":
             opts = c.fix[2] or self.projects()
             i = self.pick("default project", opts, cli_project())
@@ -3635,7 +4749,7 @@ class Tui:
         while True:
             if first_login_check and self.st.logged_in is False:
                 first_login_check = False
-                self.tab = 3
+                self.tab = T_SETUP
                 self.flash(f"not logged in: {key_name(KEYS['login'])} logs you in (or Enter on the ✖ items)")
             elif first_login_check and self.st.logged_in:
                 first_login_check = False
@@ -3644,14 +4758,23 @@ class Tui:
             if self.st.scope != self.project:
                 self.st.scope = self.project
                 self.poller.wake()
+            if (self.st.want_quota, self.st.want_apps) != (self.tab == T_QUOTA, self.tab == T_APPS):
+                self.st.want_quota, self.st.want_apps = self.tab == T_QUOTA, self.tab == T_APPS
+                if self.tab in (T_QUOTA, T_APPS):
+                    self.poller.wake()
+            if self.after_start:
+                self.check_after_start()
             self.draw()
             k = self.scr.getch()
             if k == -1:
                 continue
             h = self.scr.getmaxyx()[0]
             if k == 27:
+                if self.after_start:
+                    self.flash(f"stopped waiting for {self.after_start['name']} (it keeps starting)")
+                    self.after_start = None
                 continue
-            if ord("1") <= k <= ord("4"):
+            if ord("1") <= k < ord("1") + len(TABS):
                 self.tab = k - ord("1")
             elif k == ord("\t"):
                 self.tab = (self.tab + 1) % len(TABS)
@@ -3662,10 +4785,19 @@ class Tui:
             elif self.tab in (1, 2) and k in (curses.KEY_UP, ord("k")):
                 key = "wl" if self.tab == 1 else "act"
                 self.sel[key] = max(0, self.sel[key] - 1)
-            elif self.tab == 3 and k in (curses.KEY_DOWN, ord("j")):
+            elif self.tab == T_SETUP and k in (curses.KEY_DOWN, ord("j")):
                 self.sel["setup"] += 1
-            elif self.tab == 3 and k in (curses.KEY_UP, ord("k")):
+            elif self.tab == T_SETUP and k in (curses.KEY_UP, ord("k")):
                 self.sel["setup"] = max(0, self.sel["setup"] - 1)
+            elif self.tab in (T_QUOTA, T_APPS) and k in (curses.KEY_DOWN, ord("j")):
+                self.sel["quota" if self.tab == T_QUOTA else "apps"] += 1
+            elif self.tab in (T_QUOTA, T_APPS) and k in (curses.KEY_UP, ord("k")):
+                key = "quota" if self.tab == T_QUOTA else "apps"
+                self.sel[key] = max(0, self.sel[key] - 1)
+            elif self.tab == T_QUOTA and k in (10, 13, curses.KEY_ENTER):
+                self.quota_enter()
+            elif self.tab == T_APPS and k in (10, 13, curses.KEY_ENTER):
+                self.app_describe()
             elif self.tab == 1 and k == curses.KEY_NPAGE:
                 self.dscroll += h - 8
             elif self.tab == 1 and k == curses.KEY_PPAGE:
@@ -3674,12 +4806,34 @@ class Tui:
                 self.do_shell()
             elif self.tab == 2 and k in (10, 13, curses.KEY_ENTER):
                 self.go_to_workload()
-            elif self.tab == 3 and k in (10, 13, curses.KEY_ENTER):
+            elif self.tab == T_SETUP and k in (10, 13, curses.KEY_ENTER):
                 if self.checks:
                     self.do_fix(self.checks[min(self.sel["setup"], len(self.checks) - 1)])
             elif 0 <= k < 0x110000:
                 if self.dispatch(chr(k)) == "quit":
                     return
+
+    def check_after_start(self):
+        """G in the form: once the workload runs, attach to it (or shell in); stop if it fails."""
+        a = self.after_start
+        w = self.st.find(a["project"], a["name"])
+        verb = "attach" if a["attach"] else "shell in"
+        if w and w.get("phase") == "Running":
+            self.after_start = None
+            self.tab = 2
+            (self.do_attach if a["attach"] else self.do_shell)(w)
+        elif w and w.get("phase") in TERMINAL:
+            self.after_start = None
+            self.flash(f"{a['name']} is {w.get('phase')}: not starting a {verb} (l shows its logs)")
+        elif time.time() - a["t0"] > 900:
+            self.after_start = None
+            self.flash(f"{a['name']} did not start in 15 minutes: stopped waiting (it is still queued)")
+        elif not self.st.in_flight() and not w and time.time() - a["t0"] > 60:
+            self.after_start = None
+            self.flash(f"{a['name']} did not appear: see Activity")
+        elif not self.status or "waiting for" in self.status:
+            phase = (w or {}).get("phase") or "submitting"
+            self.flash(f"{SPIN[self.tick % 10]} waiting for {a['name']} to run ({phase}), then {verb} · Esc stops waiting")
 
     def dispatch(self, ch):
         """Run the action bound to ch on this tab (keys: in the config; plugins add their own)."""
@@ -3725,13 +4879,19 @@ class Tui:
             "forget_done": self.forget_done,
             "fix_all": self.fix_all,
             "logout": self.do_logout,
+            "theme": self.choose_theme,
+            "pvcs": self.show_pvcs,
+            "attach": self.do_attach,
+            "app_describe": self.app_describe,
+            "app_delete": self.app_delete,
+            "app_submit": self.app_submit,
         }
         handlers[act]()
         return act
 
     def refresh(self):
         self.poller.wake()
-        if self.tab == 3:
+        if self.tab == T_SETUP:
             self.recheck()
         else:
             self.flash("refreshing ...")
@@ -3774,6 +4934,8 @@ ANSI = {"ok": "32", "warn": "33", "info": "36", "err": "31", "dim": "2", "brand"
 
 def _ansi_theme():
     for style, (fg, _) in theme().items():
+        if style == "base":
+            continue
         code = "39" if fg < 0 else f"3{fg}" if fg < 8 else f"38;5;{fg}"
         ANSI[style] = code
         if style == "brand":
@@ -3805,6 +4967,26 @@ def cli_load(sess, st):
     Poller(sess, st).poll()
     if st.error:
         sys.exit(f"Run:ai: {st.error}")
+
+
+def cli_quota(args):
+    sess, st = cli_session()
+    st.want_quota = True
+    cli_load(sess, st)
+    rows = org_rows(st.projects, st.departments)
+    print(ansi(f"{'':<26}{'GPU':<26}{'alloc':>6} {'quota':>6} {'over':>6} {'limit':>6} {'pend':>5}", "dim"))
+    for dname, dt, kids in rows:
+        q = dt["quota"]
+        bar = render_cells(quota_cells(24, dt["alloc"], q or 0, None), {})
+        print(ansi(f"▸ {dname:<23} ", "brand") + f" {bar}  {num(dt['alloc']):>5} {num(q) if q is not None else '-':>6}")
+        for p, t in kids:
+            over = max(0, t["alloc"] - t["quota"])
+            bar = render_cells(quota_cells(24, t["alloc"], t["quota"], t["limit"]), {})
+            print(f"    {p['name']:<22} {bar}  {num(t['alloc']):>5} {num(t['quota']):>6} "
+                  + ansi(f"{num(over) if over else '':>6}", "warn")
+                  + f" {num(t['limit']) if t['limit'] is not None else '∞':>6} {num(t['pending']) if t['pending'] else '':>5}")
+    if st.dept_error:
+        print(ansi(f"\ndepartments: {st.dept_error} (totals added up from your projects)", "warn"))
 
 
 def cli_status(args):
@@ -4027,6 +5209,9 @@ def cli_config(args):
         print(f"  {key_name(KEYS[a]):<6} {a:<24} {where:<10} {label}")
     presets = list_presets()
     print(ansi("\npresets", "brand") + f"  {', '.join(presets) or '(none)'}")
+    cur, src = theme_choice()
+    print(ansi("theme", "brand") + f"    {cur}" + (ansi(f"  {src}", "info") if src else "")
+          + ansi(f"  (of {', '.join(load_themes())}; `runai-tui theme` to change)", "dim"))
     if PLUGINS.loaded:
         print(ansi("plugins", "brand") + "  " + ", ".join(PLUGINS.loaded))
     errs = CONFIG_ERRORS + PLUGINS.errors + site_binds()[1]
@@ -4035,13 +5220,35 @@ def cli_config(args):
     sys.exit(1 if errs else 0)
 
 
+def cli_theme(args):
+    if args.import_file:
+        try:
+            args.name = import_theme(args.import_file)
+        except (OSError, ValueError, yaml.YAMLError) as e:
+            sys.exit(f"runai-tui: can't import {args.import_file}: {str(e).splitlines()[0]}")
+        print(f"imported {args.import_file} as {args.name} ({THEME_DIRS[-1]}/{args.name}.yaml)")
+    themes = load_themes()
+    if args.name:
+        if args.name not in themes:
+            sys.exit(f"runai-tui: no theme {args.name} (themes: {', '.join(themes)})")
+        save_theme_choice(args.name)
+        print(f"using {themes[args.name].get('name') or args.name} (saved in {THEME_CHOICE})")
+        return
+    cur, src = theme_choice()
+    for n, t in themes.items():
+        mark = ansi("●", "ok") if n == cur else " "
+        print(f" {mark} {n:<20} {str(t.get('name') or n):<28} {ansi(t['_src'], 'dim')}")
+    if src:
+        print(ansi(f"\nin use: {cur} (from {src})", "dim"))
+
+
 def main():
     sanitize_env()
     if sys.argv[1:2] != ["config"]:
         load_plugins()
     if ENV_NOTE:
         print(f"runai-tui: {ENV_NOTE}", file=sys.stderr)
-    commands = {"status", "ls", "doctor", "submit", "watch", "save", "shell", "config"}
+    commands = {"status", "ls", "doctor", "submit", "watch", "save", "shell", "config", "theme", "quota"}
     if len(sys.argv) > 1 and sys.argv[1] in commands:
         p = argparse.ArgumentParser(prog="runai-tui", description=__doc__.split("\n")[0])
         sub = p.add_subparsers(dest="cmd", required=True)
@@ -4069,8 +5276,13 @@ def main():
         s.add_argument("-p", "--project")
         s = sub.add_parser("config", help="the configuration in use, and where each value comes from")
         s.add_argument("--defaults", action="store_true", help="print the built-in defaults as YAML")
+        sub.add_parser("quota", help="GPU quota by department and project")
+        s = sub.add_parser("theme", help="list colour themes, choose one, or import a VS Code theme")
+        s.add_argument("name", nargs="?", help="the theme to use from now on")
+        s.add_argument("--import", dest="import_file", metavar="FILE",
+                       help="import a VS Code colour theme (.json) or a runai-tui theme (.yaml), and use it")
         args = p.parse_args()
-        {"status": cli_status, "ls": cli_ls, "doctor": cli_doctor, "submit": cli_submit, "watch": cli_watch,
+        {"theme": cli_theme, "quota": cli_quota, "status": cli_status, "ls": cli_ls, "doctor": cli_doctor, "submit": cli_submit, "watch": cli_watch,
          "save": cli_save, "shell": cli_shell, "config": cli_config}[args.cmd](args)
         return
     p = argparse.ArgumentParser(prog="runai-tui", usage="%(prog)s [-p PROJECT] | {status,ls,doctor,submit,watch,save,shell,config} ...",
@@ -4084,7 +5296,7 @@ def main():
     poller = Poller(sess, st)
     poller.start()
     os.environ.setdefault("ESCDELAY", "25")
-    curses.wrapper(lambda scr: Tui(scr, sess, st, poller, args.project, 3 if args.setup else 0).run())
+    curses.wrapper(lambda scr: Tui(scr, sess, st, poller, args.project, T_SETUP if args.setup else 0).run())
 
 
 if __name__ == "__main__":

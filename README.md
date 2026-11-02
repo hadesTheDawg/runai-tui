@@ -16,7 +16,14 @@ logged, so it can do nothing the user couldn't do by hand.
   progress bars from Submitted to Running/Completed.
 - **Workloads**: details, shell (`runai workload exec -it`), logs, describe,
   port-forward, delete, and save as a re-submittable YAML manifest.
-- **CLI mode**: `status`, `ls`, `doctor`, `submit`, `watch`, `save`, `shell`, `config`.
+- **CLI mode**: `status`, `ls`, `doctor`, `submit`, `watch`, `save`, `shell`, `config`, `theme`, `quota`.
+- **Attach** to a workload's main program (`t`), or submit and attach/shell in once it runs (`G` in the form).
+- **PVCs**: browse the project's claims with sizes (`v`) and mount existing ones from the form.
+- **Save to Run:ai** (`M` in the form): the form as a workload template, environment, compute resource or
+  data source, visible in the Run:ai UI.
+- **Quota** by department and project (tab 4) and **AI applications** (tab 5: list, describe, submit, delete).
+- **Colour themes**: Dracula, One Dark Pro, Monokai, Solarized Dark built in, with live
+  preview (`T`); import your own VS Code theme `.json`.
 - **Customizable**: site values, Run:ai assets in the form (templates, compute
   resources, data sources), form presets, key bindings, colours, submit hooks
   and plugins, from `/etc/runai-tui/config.yaml` and

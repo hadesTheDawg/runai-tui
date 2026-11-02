@@ -34,10 +34,11 @@ Every change it makes is a `runai`/`kubectl` command, written to a log.
 7. [Submitting YAML files](#7-submitting-yaml-files)
 8. [Activity: progress bars](#8-activity-progress-bars)
 9. [Saving a workload as YAML](#9-saving-a-workload-as-yaml)
-10. [Keys](#10-keys)
-11. [Command-line mode](#11-command-line-mode)
-12. [Troubleshooting](#12-troubleshooting)
-13. [Notes for administrators](#13-notes-for-administrators)
+10. [Quota and AI applications](#10-quota-and-ai-applications)
+11. [Keys](#11-keys)
+12. [Command-line mode](#12-command-line-mode)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Notes for administrators](#14-notes-for-administrators)
 
 ---
 
@@ -59,7 +60,7 @@ identity, quota and in-flight workloads on one screen.
 
 ```
  ▲ team-a Researcher · Run:ai   jdoe@example.com          ● runai.example.com  token 14m36s  updated 4s ago
- 1 Overview    2 Workloads    3 Activity    4 Setup                                  project: team-a (p)
+ 1 Overview    2 Workloads    3 Activity    4 Quota    5 Apps    6 Setup             project: team-a (p)
    You                                    Quota · team-a
   Jane Doe                                team-a  department research          1 GPU guaranteed
   email   jdoe@example.com                pool     GPU used / quota          alloc quota limit  non-pre  CPU  memory
@@ -72,7 +73,7 @@ identity, quota and in-flight workloads on one screen.
 - **Header**: your group (`<group> Researcher`), your login, the control plane, how long your current token
   has left (it renews itself), and when the data was last refreshed. The
   data refreshes every 6 s, or every 2 s while something is in flight.
-- **Tabs** `1`–`4`: Overview, Workloads, Activity, Setup. The Activity tab
+- **Tabs** `1`–`6`: Overview, Workloads, Activity, Quota, Apps, Setup. The Activity tab
   shows `(n)` workloads in flight; Setup shows `(!n)` items that need
   attention.
 - **Project** (`p`): what Overview and Workloads show. It starts at your
@@ -83,7 +84,7 @@ identity, quota and in-flight workloads on one screen.
 
 ## 3. Setup: logging in and housekeeping
 
-Tab `4` is the one-time CLI and kubectl setup, as a checklist checked live:
+Tab `6` is the one-time CLI and kubectl setup, as a checklist checked live:
 
 | Check | Fix (Enter) |
 |---|---|
@@ -99,6 +100,7 @@ Tab `4` is the one-time CLI and kubectl setup, as a checklist checked live:
 | Your manifests folder | copy the site's example manifests into `~/runai` (if it provides some) |
 | Home directory | free space, permissions, site UID (informational) |
 | runai-tui configuration | config files in use and any problems in them (`runai-tui config`) |
+| Colour theme | the theme in use; `Enter` (or `T` anywhere) opens the theme picker |
 
 `Enter` fixes the selected item. `A` fixes everything that needs no input,
 re-checking between rounds, because some fixes only become possible after
@@ -163,6 +165,7 @@ phases runai-tui has seen with how long each lasted.
 | Key | Does |
 |---|---|
 | `Enter` / `s` | **shell**: `runai workload exec <name> -it -- bash` (falls back to `sh`) in your home directory; asks which pod/container if there are several. `exit` returns. |
+| `t` | **attach** to the workload's main program: its own terminal, not a new shell (useful for programs started with `--stdin --tty`, or `G` in the form). Uses `kubectl attach`, where **Ctrl-P Ctrl-Q** detaches and leaves it running; `exit` ends the program and the workload. Falls back to `runai workspace/training … attach`, which cannot detach. |
 | `l` | logs (last 3000 lines) in a pager with `/` search |
 | `L` | follow logs live (`runai workload logs -f`); Ctrl-C returns |
 | `d` | `runai workload describe` (events, pods, why pending) |
@@ -183,7 +186,7 @@ right. Use `↑/↓` to move, `Enter` to edit text or open a list, and `←/→`
 | Field | Notes |
 |---|---|
 | Project, Name | name: lowercase, digits, `-`, ≤ 63 characters, unique in the project |
-| Template | a Run:ai workload template: fills environment, compute, data sources, command and env vars (shown when your project has templates) |
+| Template | a Run:ai workload template: fills kind, image or environment, compute, data sources, PVCs, bind mounts, command, env vars, node pool, priority (shown when your project has templates) |
 | Kind | **batch job**: a `Job` that ends, preemptible (may borrow idle GPUs). **interactive**: a `Job` running `sleep infinity` as a Run:ai *Build* workload, non-preemptible; shell into it with `Enter`. **service**: a `Deployment`. **Run:ai workspace**: `runai workspace submit --environment …`, which keeps the environment's tools and URLs (Jupyter, VS Code, ...). |
 | Environment | an environment from the Run:ai catalog; fills image and command |
 | Image, Command | command runs as `sh -c "<command>"`; empty = the image's default |
@@ -193,6 +196,7 @@ right. Use `↑/↓` to move, `Enter` to edit text or open a list, and `←/→`
 | CPU cores, Memory | requests = limits |
 | Run as me + home | your UID/GID, the shared home (`site.home`, default `/home`) mounted, `HOME` and working directory = your home |
 | Data sources | Run:ai PVC, NFS, host-path and config-map data sources, mounted where they say (`Enter`, then Space to tick) |
+| Existing PVCs | claims in the project's namespace: `Enter`, then `a` picks one from a list showing size, status, access mode and storage class, and you type where to mount it (default `/data/<claim>`); read-write unless `Space` makes it `[ro]`. `v` anywhere lists the project's PVCs. |
 | Bind mounts | host paths from the site's list (e.g. `/etc/passwd`, `/etc/group`), read-only unless the site says otherwise; some may be ticked already |
 | Extra bind mounts | your own host paths: `Enter` opens a list. `a` (or `Enter` on *+ add*) opens a new row in the list where you type the host path (Tab completes), then the path in the container, and the list grows as you add more; `e` edits; `Space` switches read-only / read-write; `d` deletes; `q` returns to the form |
 | Scratch, /dev/shm | node-local `emptyDir` at `/scratch` (sets `TMPDIR`), bigger shared memory |
@@ -212,6 +216,8 @@ pending.
 | `W` | write the manifest to `~/runai/<name>.yaml` (or the workspace command as a `.sh` script) without submitting |
 | `E` | write it, open it in `$EDITOR`, then submit the edited file |
 | `P` | presets: load one, save the form as one, delete one of yours (`~/.config/runai-tui/presets/`); one named `default` fills every new form |
+| `G` | submit, wait until it runs, then **attach** (a workspace with a custom image and no command: you get the image's own program, e.g. bash, started with `--stdin --tty`) or **shell in** (everything else). `Esc` stops waiting; the workload keeps starting. |
+| `M` | **save to Run:ai** in the form's project, visible in the Run:ai UI too: the whole form as a **workload template**, the image and command as an **environment**, CPU/memory/GPU as a **compute resource**, or a bind mount or PVC mount as a **data source**. The form then uses what you saved. Your Run:ai role must allow creating these in the project. |
 | `Esc` | discard (asks first) |
 
 Priority, preemptibility and category are written into the manifest as
@@ -311,20 +317,53 @@ Change `metadata.name` first if the old one still exists.
 
 ---
 
-## 10. Keys
+## 10. Quota and AI applications
+
+**Quota** (`4`) shows GPUs for every department and project you can see:
+allocated against the guaranteed quota (the `┆` mark), what is over quota
+(borrowed idle GPUs, preemptible), the limit (`∞` none), GPUs requested but
+pending, and the over-quota weight. `Enter` on a project shows that project
+on the other tabs. If your role cannot read departments, their totals are
+added up from your projects. `runai-tui quota` prints the same.
+
+**Apps** (`5`) lists AI applications: Helm charts that Run:ai deploys as a
+group of workloads. `Enter` / `d` runs `runai application describe`, `x`
+deletes one, and `S` submits one: a name, the chart URL (`.tgz`), and
+optionally a values file, `--set` overrides (`key=value; key2=value2`) and
+an NGC credential. Submit hooks run for applications too.
+
+---
+
+## 11. Keys
 
 ```
-Everywhere   1-4 tabs · Tab next · n new · F submit files · p project · r refresh · ! log · ? help · q quit
+Everywhere   1-6 tabs · Tab next · n new · F submit files · p project · v PVCs · r refresh · T theme · ! log · ? help · q quit
 Workloads    ↑↓ move · PgUp/PgDn details · / filter · a mine/everyone
-             Enter/s shell · l logs · L follow · d describe · y save YAML · f port-forward
+             Enter/s shell · t attach · l logs · L follow · d describe · y save YAML · f port-forward
              u copy URL · c copy name · z suspend/resume · x delete
 Activity     ↑↓ · Enter go to · D forget finished (and the workload keys)
 Setup        ↑↓ · Enter fix · A fix all · i log in · o log out · r re-check
-Form         ↑↓ field · Enter/←→ change · S submit · W write · E edit+submit · P presets · Esc cancel
+Quota        ↑↓ · Enter show that project
+Apps         ↑↓ · Enter/d describe · S submit · x delete
+Form         ↑↓ field · Enter/←→ change · S submit · G submit+attach · W write · E edit+submit
+             M save to Run:ai · P presets · Esc cancel
 Pagers       ↑↓ PgUp/PgDn g/G · / search · n next · q back
 ```
 
 Marks: `★` yours · `●` running · `◐` pending/starting · `✔` completed · `✖` failed · `■` stopped.
+
+### Colour themes
+
+`T` (or Setup → *Colour theme*) opens the theme picker. Moving through the
+list previews each theme on the whole screen; `Enter` keeps it, `Esc` goes
+back to the one you had. Built in: **Default** (your terminal's colours),
+**Dracula**, **One Dark Pro**, **Monokai** and **Solarized Dark**.
+
+`i` in the picker imports your own: a VS Code colour theme (the `.json` file
+in the extension's `themes/` folder, e.g. under `~/.vscode/extensions/`, copied
+to the login node) or a runai-tui `.yaml` theme. It is saved in
+`~/.config/runai-tui/themes/` and `d` deletes it again. Your choice is kept in
+`~/.config/runai-tui/current-theme`.
 
 These are the default keys. They can be remapped (`keys:` in the
 configuration), and `?` always shows the ones in use. See
@@ -332,12 +371,13 @@ configuration), and `?` always shows the ones in use. See
 
 ---
 
-## 11. Command-line mode
+## 12. Command-line mode
 
 The same functions without the UI, for scripts and quick checks:
 
 ```bash
 runai-tui status                 # identity, quota bars per pool, your workloads
+runai-tui quota                  # GPU quota by department and project
 runai-tui ls                     # your workloads in the default project
 runai-tui ls -A                  # everyone's, in all your projects
 runai-tui doctor                 # setup checklist (exit 1 if anything is not ok)
@@ -349,6 +389,8 @@ runai-tui save NAME [-o FILE|-]  # workload -> YAML (default ~/runai/NAME.yaml; 
 runai-tui shell NAME             # = runai workload exec NAME -it -- bash
 runai-tui config                 # configuration in use and where each value comes from
 runai-tui config --defaults      # the built-in defaults as YAML, to start a config file
+runai-tui theme [NAME]           # list colour themes, or use NAME from now on
+runai-tui theme --import FILE    # import a VS Code colour theme (.json) or a .yaml theme, and use it
 ```
 
 Logging in stays interactive: `runai login user -u <you>@example.com`, or the
@@ -356,7 +398,7 @@ TUI.
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -373,7 +415,7 @@ TUI.
 
 ---
 
-## 13. Notes for administrators
+## 14. Notes for administrators
 
 - Installed by `./install.sh` from this repo (`install -m 755 runai-tui.py /usr/local/bin/runai-tui`). Python 3.9 + PyYAML (system packages), no
   other dependencies. It honours `RUNAI_CLI_CONFIG_PATH` and `KUBECONFIG`.
@@ -381,11 +423,22 @@ TUI.
   `runai auth get-token` (an ExecCredential; `status.token`, 15-minute JWT,
   refreshed by the CLI): `/api/v1/org-unit/projects` (quota, per-pool
   status: CPU in millicores, memory in MB), `/api/v1/workloads`,
-  `/api/v1/workloads/<id>/pods`, `/api/v1/asset/environment`, and for the
-  form `/api/v1/asset/compute`, `/api/v1/asset/datasources` and
-  `/api/v1/asset/workload-template` (all paths configurable under `api:`). Researchers
-  get 403 on `/api/v1/node-pools` and `runai nodepool list`, so cluster-wide
-  free capacity is not shown.
+  `/api/v1/workloads/<id>/pods`, `/api/v1/asset/environment`, for the
+  form `/api/v1/asset/compute`, `/api/v1/asset/datasource` and
+  `/api/v1/workload-templates`, and while their tabs are open
+  `/api/v1/org-unit/departments` and `/api/v1/ai-applications` (all paths
+  configurable under `api:`). Researchers get 403 on `/api/v1/node-pools` and
+  `runai nodepool list`, so cluster-wide free capacity is not shown.
+- `M` in the form writes through the same API, because the 3.0 CLI cannot
+  create assets or templates: `POST /api/v1/asset/environment`,
+  `/api/v1/asset/compute`, `/api/v1/asset/datasource/host-path|pvc` and
+  `/api/v1/workload-templates/trainings|workspaces`, scoped to the form's
+  project. Templates store everything inline (a template linked to an
+  environment asset may not set its command, environment variables or user),
+  with "Run as me" as `uidGidSource: fromIdpToken`; data sources are linked by
+  id. A role without create permission gets the API's 403 in the status line.
+- PVC sizes come from `kubectl get pvc -n <project namespace>`; without that
+  permission only the names from `runai pvc list` are shown.
 - The Run:ai URL comes from `site.control_plane` if a config file sets it, else
   `--cp-url` in `/etc/profile.d/runai-cli.sh`, else `$RUNAI_CP_URL`; the
   optional skeleton kubeconfig and examples from `/usr/local/share/runai`. These and
